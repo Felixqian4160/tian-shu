@@ -8,3 +8,11 @@ daily_output/
 data/
 .DS_Store
 *.duckdb.wal
+data/
+*.duckdb
+*.duckdb*
+*.pkl
+*.parquet
+daily_output/
+backtest_report.html
+.claude_dashboard_script_check.js

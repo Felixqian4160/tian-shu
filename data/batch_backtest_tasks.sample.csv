@@ -1,3 +1,0 @@
-﻿task_id,batch_no,priority,enabled,stock_code,strategy_id,start_date,end_date,capital,kline_type,data_source,scenario_tag,cost_profile,slippage_bp,commission_rate,stamp_tax_rate,min_lot,enforce_t1,max_retry,status,report_id,error_msg,created_at,updated_at
-T000001,B01,1,1,600941.SH,34R1U500V31B,2025-07-01,2025-12-31,1000000,5min,default,base_normal,cost_base,2,0.00025,0.001,100,1,1,pending,,,2026-03-28 15:31:58,2026-03-28 15:31:58
-T000002,B01,1,1,000001.SZ,34R1U500V31B,2025-07-01,2025-12-31,1000000,5min,default,base_normal,cost_base,2,0.00025,0.001,100,1,1,pending,,,2026-03-28 15:31:58,2026-03-28 15:31:58
