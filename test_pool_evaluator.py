@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """天枢 方案C — 池模式评估引擎 + 因子扫描"""
 import sys, os, time
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
-os.chdir(os.path.dirname(__file__))
+
+def main():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+    os.chdir(os.path.dirname(__file__))
 
 from src.evaluation.pool_evaluator import (
     PoolEvaluator, factor_low_vol, factor_momentum, factor_trend_quality, scan_factors
@@ -40,5 +42,8 @@ for i, s in enumerate(top):
     print(f"  {i+1}. {s}")
 
 ev.close()
-print("\n✅ 方案C 池模式引擎验证通过")
-print(f"   总耗时: {time.time() - t0:.1f}s")
+    print("\n✅ 方案C 池模式引擎验证通过")
+    print(f"   总耗时: {time.time() - t0:.1f}s")
+
+if __name__ == "__main__":
+    main()

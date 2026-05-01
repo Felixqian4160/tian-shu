@@ -24,6 +24,7 @@ from src.utils.mysql_provider import MysqlProvider
 from src.utils.postgres_provider import PostgresProvider
 from src.utils.duckdb_provider import DuckDbProvider
 from src.utils.tdx_provider import TdxProvider
+from src.utils.jarvis_duckdb_provider import JarvisDuckDbProvider
 from src.utils.indicators import Indicators
 from src.utils.config_loader import ConfigLoader
 from src.consistency.collectors.live_snapshot_collector import LiveSnapshotCollector
@@ -58,6 +59,8 @@ class LiveCabinet:
             print("🌐 Data Source: DuckDB")
         elif self.provider_type == 'tdx':
             self.provider = TdxProvider()
+        elif self.provider_type in ('jarvis_duckdb', 'tianshu'):
+            self.provider = JarvisDuckDbProvider()
             print("🌐 Data Source: TDX")
         else:
             self.provider = DataProvider()

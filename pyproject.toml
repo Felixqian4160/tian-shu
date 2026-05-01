@@ -1,0 +1,35 @@
+[project]
+name = "tian-shu"
+version = "1.0.0"
+description = "天枢 — 金策智算 × V14 融合量化引擎"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb",
+    "pandas",
+    "numpy",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+full = [
+    "tushare",
+    "akshare",
+    "mootdx",
+    "tdxpy",
+    "fastapi",
+    "uvicorn",
+    "requests",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501", "F403", "F405"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v --tb=short"

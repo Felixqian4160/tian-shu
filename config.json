@@ -1,7 +1,7 @@
 {
   "system": {
     "mode": "live",
-    "enable_live": false,
+    "enable_live": true,
     "initial_capital": 1000000,
     "live_kline_log_on_change_only": true,
     "log_level": "INFO",
@@ -25,7 +25,7 @@
     "live_auto_start_strategy_ids": []
   },
   "data_provider": {
-    "source": "jarvis_duckdb",
+    "source": "tdx",
     "enable_fallback": false,
     "tushare_api_url": "http://tushare.xyz",
     "tushare_token": "f10cbaea839fe80325b017ae338aa321e95fd905b9a96b9ec48d07c2",
@@ -116,18 +116,12 @@
     "direct_db_source": ""
   },
   "targets": [
-    "600036.SH",
-    "000001.SZ",
-    "600519.SH"
+    "600036.SH"
   ],
   "strategies": {
     "active_ids": [
-      "00",
       "03",
-      "05",
-      "06",
-      "07",
-      "v14"
+      "07"
     ]
   },
   "risk_control": {

@@ -159,6 +159,14 @@ def test_backtest_integration():
 
 
 if __name__ == "__main__":
+    # Skip if no DuckDB data available
+    try:
+        from src.utils.jarvis_duckdb_provider import _get_db_path
+        _get_db_path()
+    except FileNotFoundError:
+        print("SKIP: DuckDB database not found. Set TIANSHU_DUCKDB_PATH or ensure quant_merged_v2/data/quant.duckdb exists.")
+        import sys; sys.exit(0)
+
     test_connectivity()
     test_fetch_single_stock()
     test_fetch_index()

@@ -3,6 +3,8 @@ from src.core.live_cabinet import LiveCabinet
 from src.utils.config_loader import ConfigLoader
 import os
 
+import asyncio
+
 def main():
     # Load Config
     config = ConfigLoader()
@@ -43,7 +45,7 @@ def main():
         provider_type=provider, 
         tushare_token=tushare_token
     )
-    cabinet.run_live()
+    asyncio.run(cabinet.run_live())
 
 if __name__ == "__main__":
     main()

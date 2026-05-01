@@ -4,12 +4,8 @@ import numpy as np
 from datetime import datetime, timedelta
 
 class DataGenerator:
-    """
-    Mock Data Generator for testing when no real data source is available.
-    """
-    def __init__(self):
-        pass
-        
+    """Mock Data Generator"""
+    def __init__(self): pass
     def fetch_minute_data(self, code, start_time, end_time):
         """
         Generate mock minute data (Sine wave + Random noise)
@@ -74,3 +70,12 @@ class DataGenerator:
             'vol': 5000,
             'amount': 50000.0
         }
+
+
+def generate_mock_data(stock_code, start_date=None, end_date=None):
+    """兼容 main.py 的 mock 数据生成函数"""
+    g = DataGenerator()
+    from datetime import datetime
+    if start_date is None: start_date = datetime(2024,1,1)
+    if end_date is None: end_date = datetime(2025,12,31)
+    return g.fetch_minute_data(stock_code, start_date, end_date)
