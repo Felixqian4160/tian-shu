@@ -1,0 +1,10 @@
+tian-shu/
+__pycache__/
+*.pyc
+daily_output/
+*.pyc
+__pycache__/
+daily_output/
+data/
+.DS_Store
+*.duckdb.wal

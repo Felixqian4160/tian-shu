@@ -1,0 +1,8743 @@
+
+import asyncio
+import argparse
+import csv
+import json
+import os
+import importlib
+import sys
+import traceback
+import math
+import numbers
+import re
+import time
+import urllib.request
+import urllib.error
+import io
+import subprocess
+import threading
+import uuid
+import signal
+from contextlib import asynccontextmanager
+from collections import deque
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.lines as mlines
+from matplotlib import font_manager
+from datetime import datetime, timedelta
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException, Request
+from fastapi.responses import HTMLResponse, StreamingResponse, Response, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from pydantic import BaseModel
+from typing import Optional, Dict, List, Any
+from src.core.live_cabinet import LiveCabinet
+from src.core.backtest_cabinet import BacktestCabinet
+from src.utils.config_loader import ConfigLoader
+import src.strategies.strategy_factory as strategy_factory_module
+from src.strategies.strategy_manager_repo import (
+    list_all_strategy_meta,
+    next_custom_strategy_id,
+    build_fallback_strategy_code,
+    add_custom_strategy,
+    update_custom_strategy,
+    delete_strategy,
+    set_strategy_enabled,
+    list_strategy_dependents,
+    is_builtin_strategy_id
+)
+from src.strategy_intent.intent_engine import StrategyIntentEngine
+from src.utils.stock_manager import stock_manager
+from src.utils.data_provider import DataProvider
+from src.utils.tushare_provider import TushareProvider
+from src.utils.akshare_provider import AkshareProvider
+from src.utils.mysql_provider import MysqlProvider
+from src.utils.postgres_provider import PostgresProvider
+from src.utils.duckdb_provider import DuckDbProvider
+from src.utils.tdx_provider import TdxProvider
+from src.utils.history_sync_service import HistoryDiffSyncService, TABLE_INTERVAL_MAP, DEFAULT_SYNC_TABLES
+from src.utils.backtest_baseline import apply_backtest_baseline
+from src.utils.webhook_notifier import WebhookNotifier
+from src.tdx.formula_compiler import compile_tdx_formula, get_tdx_compile_capabilities
+from src.tdx.terminal_bridge import TdxTerminalBridge
+from src.utils.blk_loader import parse_blk_file, parse_blk_text
+from src.evolution.core.runtime_manager import EvolutionRuntimeManager
+from src.evolution.adapters.fundamental_adapter import FundamentalAdapterManager
+from src.evolution.memory.gene_run_store import PostgresGeneRunRepository
+from src.evolution.memory.profile_update_store import PostgresProfileUpdateRepository
+from src.evolution.memory.analysis_store import AnalysisStore
+from src.evolution.adapters.gene_strategy_adapter import GeneStrategyAdapter
+from src.evolution.platform.platform_hub import EvolutionPlatformHub
+from src.consistency.storage.live_snapshot_store import LiveSnapshotStore
+from src.consistency.replay.replay_builder import ReplayBuilder
+from src.consistency.replay.replay_store import ReplayStore
+from src.consistency.reporting.report_store import ConsistencyReportStore
+from src.consistency.reporting.report_builder import ConsistencyReportBuilder
+from src.consistency.adapters.backtest_report_adapter import BacktestReportAdapter
+
+import logging
+
+def _configure_matplotlib_font():
+    font_candidates = [
+        "Microsoft YaHei",
+        "SimHei",
+    ]
+    available_fonts = {f.name for f in font_manager.fontManager.ttflist}
+    chosen_font = next((name for name in font_candidates if name in available_fonts), None)
+    if chosen_font:
+        matplotlib.rcParams["font.family"] = "sans-serif"
+        matplotlib.rcParams["font.sans-serif"] = [chosen_font, "DejaVu Sans"]
+    matplotlib.rcParams["axes.unicode_minus"] = False
+
+_configure_matplotlib_font()
+
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger("CabinetServer")
+_QUIET_HTTP_PATHS = {
+    "/api/status",
+    "/api/status/light",
+    "/api/history_sync/status",
+    "/api/config",
+    "/api/config/save",
+    "/api/live/fund_pool",
+    "/api/evolution/status",
+    "/api/evolution/history",
+    "/api/evolution/top",
+    "/api/evolution/runs",
+    "/api/evolution/family_stats",
+    "/api/evolution/profile/updates",
+    "/api/backtest/kline_thumb_status",
+    "/api/backtest/kline_data",
+    "/api/fundamental/cache_list",
+    "/api/fundamental/cache_file",
+}
+
+class _UvicornAccessPathFilter(logging.Filter):
+    def filter(self, record):
+        msg = str(record.getMessage() or "")
+        for p in _QUIET_HTTP_PATHS:
+            if f" {p} " in msg or f" {p}?" in msg:
+                return False
+        return True
+
+class CachedStaticFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        try:
+            resp = await super().get_response(path, scope)
+            return resp
+        except StarletteHTTPException as e:
+            if int(getattr(e, "status_code", 500)) != 404:
+                raise
+            rel_path = str(path or "").replace("\\", "/").lstrip("/")
+            ok = await asyncio.to_thread(_cache_known_static_asset_if_missing, rel_path)
+            if not ok:
+                raise
+            return await super().get_response(path, scope)
+
+@asynccontextmanager
+async def app_lifespan(_: FastAPI):
+    await startup_event()
+    try:
+        yield
+    finally:
+        await shutdown_event()
+
+
+app = FastAPI(title="三省六部 AI 交易决策控制台", lifespan=app_lifespan)
+
+# PyInstaller 打包兼容：
+#   打包后 sys._MEIPASS 指向资源临时解压目录，所有打包资源放在此处
+#   开发模式下使用 server.py 所在目录，保证开发/打包路径一致
+def _bundle_path(relative):
+    """返回打包环境下的文件绝对路径。"""
+    if getattr(sys, "_MEIPASS", None):
+        return os.path.join(sys._MEIPASS, relative)
+    # 开发模式：基于 server.py 所在目录（而非 cwd，避免 cd 问题）
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), relative)
+
+STATIC_DIR = _bundle_path("static")
+os.makedirs(STATIC_DIR, exist_ok=True)
+app.mount("/static", CachedStaticFiles(directory=STATIC_DIR), name="static")
+
+@app.middleware("http")
+async def log_requests(request, call_next):
+    path = str(request.url.path or "")
+    quiet = path in _QUIET_HTTP_PATHS
+    if not quiet:
+        logger.info(f"Incoming Request: {request.method} {path}")
+    response = await call_next(request)
+    if not quiet:
+        logger.info(f"Response Status: {response.status_code}")
+    return response
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global variables
+active_connections = []
+cabinet_task = None
+current_cabinet = None
+live_tasks: Dict[str, asyncio.Task] = {}
+live_cabinets: Dict[str, LiveCabinet] = {}
+live_strategy_profiles: Dict[str, Any] = {}
+live_capital_profiles: Dict[str, float] = {}
+live_capital_plan_mode: str = "equal"
+live_capital_plan_weights: Dict[str, float] = {}
+live_last_error: Optional[Dict[str, Any]] = None
+daily_summary_webhook_state: Dict[str, Dict[str, Any]] = {}
+current_provider_source = None
+latest_backtest_result = None
+latest_strategy_reports = {}
+current_backtest_report = None
+current_backtest_progress = {"progress": 0, "current_date": None}
+current_backtest_trades = []
+kline_daily_cache = {}
+backtest_kline_payload_cache = {}
+BACKTEST_KLINE_PAYLOAD_CACHE_TTL_SECONDS = 8
+BACKTEST_KLINE_PAYLOAD_CACHE_MAX_ITEMS = 120
+report_strategy_kline_cache = {}
+report_ai_review_cache = {}
+report_buffett_review_cache = {}
+fundamental_adapter_manager = FundamentalAdapterManager()
+strategy_score_cache = {}
+report_detail_cache = {}
+report_history_mtime = None
+AI_REVIEW_SCHEMA_VERSION = 2
+BUFFETT_REVIEW_SCHEMA_VERSION = 1
+AI_REVIEW_SUMMARY_SCHEMA_VERSION = 1
+BUFFETT_REVIEW_SUMMARY_SCHEMA_VERSION = 1
+report_history = []
+CONSISTENCY_STORAGE_DIR = os.path.join("data", "consistency")
+REPORTS_DIR = os.path.join("data", "reports")
+REPORTS_LEGACY_FILE = os.path.join(REPORTS_DIR, "backtest_reports.json")
+REPORT_FILE_PREFIX = "backtest_report_"
+REPORT_FILE_SUFFIX = ".json"
+consistency_snapshot_store = LiveSnapshotStore(CONSISTENCY_STORAGE_DIR)
+consistency_replay_store = ReplayStore(CONSISTENCY_STORAGE_DIR)
+consistency_replay_builder = ReplayBuilder(snapshot_store=consistency_snapshot_store, replay_store=consistency_replay_store, consistency_root=CONSISTENCY_STORAGE_DIR)
+consistency_report_store = ConsistencyReportStore(CONSISTENCY_STORAGE_DIR)
+consistency_report_builder = ConsistencyReportBuilder()
+consistency_backtest_report_adapter = BacktestReportAdapter(REPORTS_DIR, REPORT_FILE_PREFIX, REPORT_FILE_SUFFIX)
+EVOLUTION_STORAGE_DIR = os.path.join("data", "evolution")
+EVOLUTION_ANALYSIS_DIR = os.path.join(EVOLUTION_STORAGE_DIR, "analysis")
+EVOLUTION_RUNS_DIR = os.path.join(EVOLUTION_STORAGE_DIR, "runs")
+EVOLUTION_FAMILY_DIR = os.path.join(EVOLUTION_STORAGE_DIR, "family")
+EVOLUTION_ANALYSIS_STORE = AnalysisStore(EVOLUTION_ANALYSIS_DIR)
+EVOLUTION_RUN_FILE_PREFIX = "evolution_run_"
+EVOLUTION_FAMILY_FILE_PREFIX = "evolution_family_"
+EVOLUTION_FILE_SUFFIX = ".json"
+PATTERN_THUMB_DIR = os.path.join(REPORTS_DIR, "pattern_thumbs")
+CLASSIC_PATTERN_ITEMS = [
+    {"stock": "688585", "start": "2025-07-09", "end": "2025-12-31"},
+    {"stock": "301030", "start": "2025-01-02", "end": "2025-06-30"},
+    {"stock": "600376", "start": "2025-07-01", "end": "2025-12-31"},
+    {"stock": "601888", "start": "2025-01-02", "end": "2025-06-30"},
+    {"stock": "300450", "start": "2025-04-01", "end": "2025-09-30"},
+    {"stock": "603083", "start": "2025-03-03", "end": "2025-08-29"},
+    {"stock": "600941", "start": "2025-07-01", "end": "2025-12-31"},
+    {"stock": "601857", "start": "2025-01-02", "end": "2025-06-30"},
+    {"stock": "300118", "start": "2025-06-02", "end": "2025-11-28"},
+    {"stock": "002475", "start": "2025-09-01", "end": "2025-12-31"}
+]
+
+# Config
+config = ConfigLoader()
+intent_engine = StrategyIntentEngine()
+history_sync_service = HistoryDiffSyncService()
+history_sync_scheduler_task = None
+live_auto_start_scheduler_task = None
+live_auto_start_last_trigger_date = ""
+live_auto_start_last_invalid_time = ""
+startup_server_host = None
+startup_server_port = None
+webhook_notifier = WebhookNotifier()
+SECRET_CONFIG_PATHS = set(ConfigLoader._default_private_override_paths)
+PRIVATE_ONLY_CONFIG_PATHS = {"targets", "strategies.active_ids"}
+SECRET_MASK = "********"
+LIVE_FUND_POOL_DIR = os.path.join("data", "live_fund_pool")
+PROJECT_ROOT = os.path.abspath(".")
+BATCH_TASKS_DIR = os.path.join("data", "batch_tasks")
+SERVER_STARTED_AT = datetime.now().isoformat(timespec="seconds")
+SERVER_BOOT_ID = f"{datetime.now().strftime('%Y%m%d%H%M%S')}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+SERVER_SHUTDOWN_CONTEXT: Dict[str, Any] = {
+    "reason": "",
+    "detail": "",
+    "origin": "",
+    "signal": "",
+    "updated_at": None,
+}
+SERVER_SIGNAL_HANDLER_CHAIN: Dict[int, Any] = {}
+server_signal_handlers_installed = False
+DEFAULT_BATCH_TASKS_CSV = os.path.join(BATCH_TASKS_DIR, "批量回测任务.csv")
+DEFAULT_BATCH_ARCHIVE_CSV = os.path.join(BATCH_TASKS_DIR, "archive", "批量回测任务.archive.csv")
+BATCH_TASK_TEMPLATE_HEADERS = [
+    "任务ID", "批次号", "优先级", "是否启用", "股票代码", "策略ID", "开始日期", "结束日期",
+    "初始资金", "K线周期", "数据源", "场景标签", "成本档位", "滑点BP", "佣金费率", "印花税率",
+    "最小手数", "是否T1", "最大重试", "任务状态", "报告ID", "错误信息", "创建时间", "更新时间"
+]
+batch_run_lock = threading.Lock()
+batch_run_state: Dict[str, Any] = {
+    "proc": None,
+    "started_at": None,
+    "finished_at": None,
+    "returncode": None,
+    "cmd": [],
+    "cwd": PROJECT_ROOT,
+    "tasks_csv": DEFAULT_BATCH_TASKS_CSV,
+    "results_csv": "data/批量回测结果.csv",
+    "summary_csv": "data/策略汇总评分.csv",
+    "batch_no_filter": "",
+    "archive_completed": False,
+    "archive_tasks_csv": DEFAULT_BATCH_ARCHIVE_CSV,
+    "max_tasks": 0,
+    "parallel_workers": 1,
+    "logs": [],
+}
+evolution_runtime = EvolutionRuntimeManager()
+evolution_platform_hub = EvolutionPlatformHub(evolution_runtime=evolution_runtime)
+evolution_gene_run_repo = PostgresGeneRunRepository()
+evolution_profile_update_repo = PostgresProfileUpdateRepository()
+evolution_gene_adapter = GeneStrategyAdapter(gene_run_repo=evolution_gene_run_repo)
+evolution_ws_events = deque(maxlen=2000)
+evolution_ws_lock = threading.Lock()
+evolution_ws_pump_task = None
+pattern_thumb_building_keys = set()
+pattern_thumb_building_lock = threading.Lock()
+pattern_thumb_warmup_task = None
+pattern_thumb_warmup_state: Dict[str, Any] = {
+    "status": "idle",
+    "total": len(CLASSIC_PATTERN_ITEMS),
+    "ready": 0,
+    "building": 0,
+    "started_at": None,
+    "finished_at": None,
+}
+_ws_event_last_emit_ts: Dict[str, float] = {}
+_WS_EVENT_THROTTLE_SECONDS = {
+    "backtest_progress": 0.8,
+    "backtest_flow": 0.8,
+    "backtest_trade": 0.5,
+    "ministry_tick": 0.3,
+    "market": 0.25,
+    "live_tick": 0.5,
+}
+_WS_SKIP_WEBHOOK_EVENT_TYPES = {"backtest_progress", "backtest_flow", "backtest_trade", "ministry_tick", "market", "live_tick"}
+
+
+def _push_evolution_ws_event(payload: Dict[str, Any]) -> None:
+    if not isinstance(payload, dict):
+        return
+    if str(payload.get("event_type", "") or "").strip():
+        try:
+            _persist_evolution_runtime_event(payload)
+        except Exception as e:
+            logger.warning("persist evolution event failed: %s", e)
+    with evolution_ws_lock:
+        evolution_ws_events.append(dict(payload))
+
+
+def _pop_all_evolution_ws_events() -> List[Dict[str, Any]]:
+    with evolution_ws_lock:
+        items = list(evolution_ws_events)
+        evolution_ws_events.clear()
+    return items
+
+
+async def _evolution_ws_pump_loop():
+    while True:
+        try:
+            items = _pop_all_evolution_ws_events()
+            for item in items:
+                kind = str(item.get("kind", "")).strip().lower()
+                if kind == "runtime_event":
+                    continue
+                if kind == "tick":
+                    payload = {"type": "evolution_tick", "data": item.get("record", {}), "server_time": datetime.now().isoformat(timespec="seconds")}
+                elif kind == "progress":
+                    payload = {"type": "evolution_progress", "data": item.get("progress", {}), "server_time": datetime.now().isoformat(timespec="seconds")}
+                elif str(item.get("type", "")).startswith("platform_"):
+                    payload = {
+                        "type": str(item.get("type", "platform_event")),
+                        "data": item.get("data", {}),
+                        "server_time": str(item.get("server_time") or datetime.now().isoformat(timespec="seconds")),
+                    }
+                else:
+                    payload = {"type": "evolution_state", "data": item.get("state", {}), "server_time": datetime.now().isoformat(timespec="seconds")}
+                await manager.broadcast(payload)
+        except Exception as e:
+            logger.error("evolution ws pump failed: %s", e, exc_info=True)
+        await asyncio.sleep(0.2)
+
+
+def _allow_ws_emit(event_type: str) -> bool:
+    et = str(event_type or "").strip()
+    throttle = float(_WS_EVENT_THROTTLE_SECONDS.get(et, 0.0) or 0.0)
+    if throttle <= 0:
+        return True
+    now = time.monotonic()
+    last = float(_ws_event_last_emit_ts.get(et, 0.0) or 0.0)
+    if last > 0 and (now - last) < throttle:
+        return False
+    _ws_event_last_emit_ts[et] = now
+    return True
+
+def _project_rel_path(path: str) -> str:
+    try:
+        return os.path.relpath(os.path.abspath(path), PROJECT_ROOT).replace("\\", "/")
+    except Exception:
+        return str(path or "").replace("\\", "/")
+
+
+def _is_subpath(parent: str, child: str) -> bool:
+    try:
+        p = os.path.abspath(parent)
+        c = os.path.abspath(child)
+        return os.path.commonpath([p, c]) == p
+    except Exception:
+        return False
+
+
+def _resolve_batch_tasks_path(raw_path: Optional[str], default_path: str = DEFAULT_BATCH_TASKS_CSV, ensure_parent: bool = False) -> str:
+    raw = str(raw_path or "").strip().replace("\\", "/")
+    if not raw:
+        raw = str(default_path).replace("\\", "/")
+    abs_path = os.path.abspath(raw if os.path.isabs(raw) else os.path.join(PROJECT_ROOT, raw))
+    if not str(abs_path).lower().endswith(".csv"):
+        raise ValueError("任务CSV必须是.csv文件")
+    tasks_root = os.path.abspath(os.path.join(PROJECT_ROOT, BATCH_TASKS_DIR))
+    if not _is_subpath(tasks_root, abs_path):
+        raise ValueError("任务CSV必须位于 data/batch_tasks 目录下")
+    if ensure_parent:
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    return abs_path
+
+def _system_mode(cfg=None):
+    c = cfg if cfg is not None else ConfigLoader.reload()
+    mode = str(c.get("system.mode", "backtest") or "backtest").strip().lower()
+    return mode if mode in {"backtest", "live"} else "backtest"
+
+def _apply_log_level(cfg=None):
+    c = cfg if cfg is not None else ConfigLoader.reload()
+    level_name = str(c.get("system.log_level", "INFO") or "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.getLogger().setLevel(level)
+    logger.setLevel(level)
+    return level_name
+
+def _server_host(cfg=None):
+    c = cfg if cfg is not None else ConfigLoader.reload()
+    env_host = str(os.environ.get("SERVER_HOST", "") or "").strip()
+    if env_host:
+        return env_host
+    cfg_host = str(c.get("system.server_host", "0.0.0.0") or "").strip()
+    return cfg_host or "0.0.0.0"
+
+def _server_port(cfg=None):
+    c = cfg if cfg is not None else ConfigLoader.reload()
+    env_port = str(os.environ.get("SERVER_PORT", "") or "").strip()
+    raw_port = env_port if env_port else str(c.get("system.server_port", 8000) or "").strip()
+    try:
+        port = int(raw_port)
+        if 1 <= port <= 65535:
+            return port
+    except (TypeError, ValueError):
+        pass
+    logger.warning("Invalid server port '%s', fallback to 8000", raw_port)
+    return 8000
+
+def _resolve_server_bind(cfg=None, argv=None):
+    c = cfg if cfg is not None else ConfigLoader.reload()
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--host", type=str, default=None)
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--prot", type=int, default=None)
+    args, _ = parser.parse_known_args(argv if argv is not None else sys.argv[1:])
+    host = _server_host(c)
+    port = _server_port(c)
+    cli_host = str(args.host or "").strip()
+    if cli_host:
+        host = cli_host
+    cli_port = args.prot if args.prot is not None else args.port
+    if cli_port is not None:
+        if 1 <= int(cli_port) <= 65535:
+            port = int(cli_port)
+        else:
+            logger.warning("Invalid cli port '%s', keep port=%s", cli_port, port)
+    return host, port
+
+
+def _signal_name(signum: Any) -> str:
+    try:
+        return signal.Signals(int(signum)).name
+    except Exception:
+        return f"SIG{signum}"
+
+
+def _mark_server_shutdown_reason(reason: str, detail: str = "", origin: str = "", signal_name: str = "", overwrite: bool = False) -> None:
+    current_reason = str(SERVER_SHUTDOWN_CONTEXT.get("reason", "") or "").strip()
+    if current_reason and not overwrite:
+        return
+    SERVER_SHUTDOWN_CONTEXT["reason"] = str(reason or "").strip()
+    SERVER_SHUTDOWN_CONTEXT["detail"] = str(detail or "").strip()
+    SERVER_SHUTDOWN_CONTEXT["origin"] = str(origin or "").strip()
+    SERVER_SHUTDOWN_CONTEXT["signal"] = str(signal_name or "").strip()
+    SERVER_SHUTDOWN_CONTEXT["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+
+def _install_server_signal_handlers() -> None:
+    global server_signal_handlers_installed
+    if server_signal_handlers_installed:
+        return
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig_obj = getattr(signal, name, None)
+        if sig_obj is None:
+            continue
+        try:
+            sig_no = int(sig_obj)
+            prev_handler = signal.getsignal(sig_no)
+        except Exception:
+            continue
+
+        def _handler(signum, frame, _prev=prev_handler):
+            sig_name = _signal_name(signum)
+            _mark_server_shutdown_reason(
+                reason="signal",
+                detail=f"received {sig_name}",
+                origin="signal_handler",
+                signal_name=sig_name,
+            )
+            logger.warning("Received exit signal: %s", sig_name)
+            if callable(_prev):
+                _prev(signum, frame)
+            elif _prev == signal.SIG_DFL:
+                raise KeyboardInterrupt(f"received {sig_name}")
+
+        try:
+            signal.signal(sig_no, _handler)
+            SERVER_SIGNAL_HANDLER_CHAIN[sig_no] = prev_handler
+        except Exception as e:
+            logger.warning("install signal handler failed: %s error=%s", name, e)
+    server_signal_handlers_installed = True
+
+def _default_target_code(cfg=None):
+    c = cfg if cfg is not None else ConfigLoader.reload()
+    targets = c.get("targets", [])
+    if isinstance(targets, list):
+        for item in targets:
+            code = str(item or "").strip()
+            if code:
+                return code
+    return "600036.SH"
+
+def _normalize_live_codes(stock_code=None, stock_codes=None, cfg=None, use_default=True):
+    out = []
+    seen = set()
+    c = cfg if cfg is not None else ConfigLoader.reload()
+    values = []
+    if isinstance(stock_codes, list):
+        values.extend(stock_codes)
+    if stock_code is not None:
+        values.append(stock_code)
+    if (not values) and use_default:
+        targets = c.get("targets", [])
+        if isinstance(targets, list):
+            values.extend(targets)
+    if (not values) and use_default:
+        values.append(_default_target_code(c))
+    for item in values:
+        code = str(item or "").strip()
+        if not code:
+            continue
+        code_upper = code.upper()
+        if code_upper in seen:
+            continue
+        seen.add(code_upper)
+        out.append(code_upper)
+    if out:
+        return out
+    if use_default:
+        return [_default_target_code(c)]
+    return []
+
+def _live_running_codes():
+    return [code for code, task in live_tasks.items() if task and (not task.done())]
+
+def _configured_live_codes(cfg=None):
+    c = cfg if cfg is not None else ConfigLoader.reload()
+    raw_targets = c.get("targets", [])
+    targets = raw_targets if isinstance(raw_targets, list) else []
+    return _normalize_live_codes(stock_codes=targets, cfg=c, use_default=False)
+
+async def _stop_live_tasks(stock_codes=None, clear_profile=False):
+    global current_cabinet
+    targets = _normalize_live_codes(stock_codes=stock_codes, use_default=False) if isinstance(stock_codes, list) else list(live_tasks.keys())
+    stopped = []
+    for code in targets:
+        task = live_tasks.get(code)
+        if task and not task.done():
+            task.cancel()
+            stopped.append(code)
+        live_tasks.pop(code, None)
+        live_cabinets.pop(code, None)
+        if clear_profile:
+            live_strategy_profiles.pop(code, None)
+            live_capital_profiles.pop(code, None)
+    if (not live_tasks) and (current_cabinet is not None):
+        current_cabinet = None
+    return stopped
+
+def _normalize_strategy_selection(strategy_id=None, strategy_ids=None):
+    if isinstance(strategy_ids, list):
+        out = []
+        seen = set()
+        for item in strategy_ids:
+            sid = str(item or "").strip()
+            if (not sid) or sid in seen:
+                continue
+            seen.add(sid)
+            out.append(sid)
+        if out:
+            return out
+    sid = str(strategy_id or "").strip()
+    if sid:
+        return sid
+    return None
+
+def _normalize_stock_strategy_map(stock_strategy_map):
+    if not isinstance(stock_strategy_map, dict):
+        return {}
+    out = {}
+    for raw_code, raw_ids in stock_strategy_map.items():
+        code = str(raw_code or "").strip().upper()
+        if not code:
+            continue
+        selection = _normalize_strategy_selection(strategy_ids=raw_ids if isinstance(raw_ids, list) else None)
+        if selection is None:
+            continue
+        out[code] = selection
+    return out
+
+def _profile_snapshot(codes=None):
+    target_codes = codes if isinstance(codes, list) else _live_running_codes()
+    out = {}
+    for code in target_codes:
+        profile = live_strategy_profiles.get(code)
+        if profile is None:
+            cab = live_cabinets.get(code)
+            if cab is not None:
+                profile = getattr(cab, "active_strategy_ids", None)
+        if profile is not None:
+            out[code] = profile
+    return out
+
+def _format_live_start_summary(codes=None):
+    target_codes = codes if isinstance(codes, list) else _live_running_codes()
+    profile_map = _profile_snapshot(target_codes)
+    summary_parts = []
+    for code in target_codes:
+        profile = profile_map.get(code)
+        if isinstance(profile, list):
+            ids_text = "、".join([str(x) for x in profile if str(x)])
+        else:
+            ids_text = str(profile) if profile is not None else "全部"
+        if not ids_text:
+            ids_text = "全部"
+        summary_parts.append(f"{code}[{ids_text}]")
+    return "；".join(summary_parts) if summary_parts else ",".join(target_codes)
+
+def _live_fund_pool_file(stock_code):
+    code = str(stock_code or "").strip().upper()
+    return os.path.join(LIVE_FUND_POOL_DIR, f"{code}.json")
+
+def _empty_live_fund_pool_state(stock_code, initial_capital):
+    cap = float(initial_capital or 0.0)
+    return {
+        "version": 1,
+        "state": {
+            "stock_code": str(stock_code or "").strip().upper(),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "initial_capital": cap,
+            "cash": cap,
+            "holdings_value": 0.0,
+            "fund_value": cap,
+            "position_count": 0,
+            "positions": [],
+            "trade_count": 0,
+            "trade_details": [],
+            "realized_pnl": 0.0,
+            "fee_summary": {
+                "total_cost": 0.0,
+                "total_commission": 0.0,
+                "total_stamp_duty": 0.0,
+                "total_transfer_fee": 0.0
+            },
+            "peak_fund_value": cap
+        },
+        "positions_state": {},
+        "transactions_all": []
+    }
+
+def _load_live_fund_pool_snapshot(stock_code, include_transactions=False, tx_limit=200):
+    code = str(stock_code or "").strip().upper()
+    cab = live_cabinets.get(code)
+    if cab is not None:
+        return cab.get_fund_pool_snapshot(include_transactions=bool(include_transactions), tx_limit=int(tx_limit or 200))
+    file_path = _live_fund_pool_file(code)
+    if not os.path.exists(file_path):
+        return None
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        state = payload.get("state", {}) if isinstance(payload, dict) else {}
+        if not isinstance(state, dict):
+            return None
+        trades = state.get("trade_details", [])
+        if isinstance(trades, list):
+            if include_transactions:
+                all_trades = payload.get("transactions_all", [])
+                if isinstance(all_trades, list) and all_trades:
+                    state["trade_details"] = all_trades[-max(1, int(tx_limit or 1)):]
+                else:
+                    state["trade_details"] = trades[-max(1, int(tx_limit or 1)):]
+            else:
+                state["trade_details"] = trades[-20:]
+        return state
+    except Exception:
+        return None
+
+def _collect_live_fund_pools(codes=None, include_transactions=False, tx_limit=200, include_persisted=False):
+    target = []
+    seen = set()
+    if isinstance(codes, list):
+        for item in codes:
+            code = str(item or "").strip().upper()
+            if code and code not in seen:
+                seen.add(code)
+                target.append(code)
+    else:
+        for code in _live_running_codes():
+            code_u = str(code or "").strip().upper()
+            if code_u and code_u not in seen:
+                seen.add(code_u)
+                target.append(code_u)
+        for code in _configured_live_codes():
+            code_u = str(code or "").strip().upper()
+            if code_u and code_u not in seen:
+                seen.add(code_u)
+                target.append(code_u)
+        if include_persisted and os.path.isdir(LIVE_FUND_POOL_DIR):
+            for fn in os.listdir(LIVE_FUND_POOL_DIR):
+                if not str(fn).lower().endswith(".json"):
+                    continue
+                code_u = str(fn[:-5] or "").strip().upper()
+                if code_u and code_u not in seen:
+                    seen.add(code_u)
+                    target.append(code_u)
+    out = {}
+    for code in target:
+        snap = _load_live_fund_pool_snapshot(code, include_transactions=include_transactions, tx_limit=tx_limit)
+        if isinstance(snap, dict):
+            out[code] = snap
+    return out
+
+def _capital_snapshot(codes=None):
+    target_codes = codes if isinstance(codes, list) else _live_running_codes()
+    out = {}
+    for code in target_codes:
+        cap = live_capital_profiles.get(code)
+        if cap is None:
+            cab = live_cabinets.get(code)
+            if cab is not None:
+                try:
+                    cap = float(getattr(cab.revenue, "initial_capital", 0.0) or 0.0)
+                except Exception:
+                    cap = None
+        if cap is not None:
+            out[code] = float(cap)
+    return out
+
+def _default_live_fund_pool_capital(stock_code, cfg=None):
+    code = str(stock_code or "").strip().upper()
+    if not code:
+        return 0.0
+    cap_profile = live_capital_profiles.get(code)
+    if cap_profile is not None:
+        try:
+            cap_val = float(cap_profile)
+            if cap_val > 0:
+                return cap_val
+        except Exception:
+            pass
+    cab = live_cabinets.get(code)
+    if cab is not None:
+        try:
+            cap_val = float(getattr(cab.revenue, "initial_capital", 0.0) or 0.0)
+            if cap_val > 0:
+                return cap_val
+        except Exception:
+            pass
+    c = cfg if cfg is not None else ConfigLoader.reload()
+    total_cap = float(c.get("system.initial_capital", 1000000.0) or 1000000.0)
+    cfg_codes = _configured_live_codes(c)
+    if cfg_codes and code in cfg_codes:
+        cap_map, _, _ = _build_live_capital_plan(
+            cfg_codes,
+            total_cap,
+            allocation_mode=live_capital_plan_mode,
+            allocation_weights=live_capital_plan_weights
+        )
+        cap_val = float(cap_map.get(code, 0.0) or 0.0)
+        if cap_val > 0:
+            return cap_val
+    return total_cap
+
+def _normalize_live_allocation_mode(mode=None):
+    m = str(mode or "equal").strip().lower()
+    if m in {"equal", "manual", "risk_parity"}:
+        return m
+    return "equal"
+
+def _normalize_live_weight_map(weights):
+    if not isinstance(weights, dict):
+        return {}
+    out = {}
+    for raw_code, raw_w in weights.items():
+        code = str(raw_code or "").strip().upper()
+        if not code:
+            continue
+        try:
+            w = float(raw_w)
+        except Exception:
+            continue
+        if w > 0:
+            out[code] = w
+    return out
+
+def _build_live_capital_plan(codes, total_capital, allocation_mode=None, allocation_weights=None):
+    target_codes = [str(c or "").strip().upper() for c in (codes or []) if str(c or "").strip()]
+    if not target_codes:
+        return {}, "equal", {}
+    mode = _normalize_live_allocation_mode(allocation_mode)
+    weights_in = _normalize_live_weight_map(allocation_weights)
+    raw_weights = {}
+    if mode == "manual":
+        for code in target_codes:
+            if code in weights_in:
+                raw_weights[code] = float(weights_in[code])
+            else:
+                raw_weights[code] = 1.0
+    elif mode == "risk_parity":
+        for code in target_codes:
+            raw_weights[code] = 1.0
+    else:
+        for code in target_codes:
+            raw_weights[code] = 1.0
+    weight_sum = float(sum(raw_weights.values()) or 0.0)
+    if weight_sum <= 0:
+        raw_weights = {code: 1.0 for code in target_codes}
+        weight_sum = float(len(target_codes))
+        mode = "equal"
+    cap_total = float(total_capital or 0.0)
+    capital_map = {}
+    normalized_weights = {}
+    for code in target_codes:
+        w_norm = float(raw_weights.get(code, 0.0) or 0.0) / weight_sum
+        normalized_weights[code] = w_norm
+        capital_map[code] = round(cap_total * w_norm, 4)
+    return capital_map, mode, normalized_weights
+
+WEBHOOK_CATEGORY_OPTIONS = [
+    {"value": "A", "label": "A 系统生命周期", "desc": "启动/停止/切换/配置生效等系统状态变化"},
+    {"value": "B", "label": "B 系统异常", "desc": "异常退出、报错、失败类系统消息"},
+    {"value": "C", "label": "C 交易决策", "desc": "策略信号（zhongshu）"},
+    {"value": "D", "label": "D 风控结果", "desc": "风控放行/驳回（menxia）"},
+    {"value": "E", "label": "E 成交执行", "desc": "成交信号（trade_exec）"},
+    {"value": "F", "label": "F 账户资金", "desc": "账户与资金池快照（account/fund_pool）"},
+    {"value": "G", "label": "G 监控告警", "desc": "实盘告警（live_alert）"},
+    {"value": "H", "label": "H 健康快照", "desc": "监控快照/数据新鲜度"},
+    {"value": "I", "label": "I 持仓手数", "desc": "持仓手数明细（live_position_lots）"},
+    {"value": "J", "label": "J 回测进度", "desc": "回测进度与流程（backtest_progress/backtest_flow）"},
+    {"value": "K", "label": "K 回测结果", "desc": "回测结果/失败/策略报告"},
+    {"value": "L", "label": "L 数据链路调试", "desc": "拉取K线/rt_min/stk_mins 等调试消息"}
+]
+
+def _webhook_system_category_by_msg(msg):
+    text = str(msg or "")
+    if (
+        ("正在拉取K线数据" in text)
+        or ("实盘实时拉取: rt_min" in text)
+        or ("历史回补: stk_mins" in text)
+    ):
+        return "L"
+    if (
+        ("异常" in text)
+        or ("失败" in text)
+        or ("error" in text.lower())
+        or ("Error" in text)
+        or ("退出" in text)
+    ):
+        return "B"
+    return "A"
+
+def _classify_webhook_category(event_type, data):
+    et = str(event_type or "").strip()
+    if et == "system":
+        msg = data.get("msg") if isinstance(data, dict) else str(data or "")
+        return _webhook_system_category_by_msg(msg)
+    if et == "zhongshu":
+        return "C"
+    if et == "menxia":
+        return "D"
+    if et == "trade_exec":
+        return "E"
+    if et in {"account", "fund_pool"}:
+        return "F"
+    if et == "live_alert":
+        return "G"
+    if et in {"live_monitor_snapshot", "live_kline_freshness"}:
+        return "H"
+    if et == "live_position_lots":
+        return "I"
+    if et in {"backtest_progress", "backtest_flow"}:
+        return "J"
+    if et in {"backtest_result", "backtest_failed", "backtest_strategy_report"}:
+        return "K"
+    return "A"
+
+def _should_notify_webhook_by_category(event_type, data):
+    cfg = ConfigLoader.reload()
+    section = cfg.get("webhook_notification", {})
+    section = section if isinstance(section, dict) else {}
+    mode = str(section.get("category_filter_mode", "off") or "off").strip().lower()
+    if mode not in {"whitelist", "blacklist"}:
+        return True
+    raw_codes = section.get("category_codes", [])
+    if not isinstance(raw_codes, list):
+        raw_codes = []
+    picked = {str(x or "").strip().upper() for x in raw_codes if str(x or "").strip()}
+    if not picked:
+        return True
+    cat = _classify_webhook_category(event_type, data)
+    if mode == "whitelist":
+        return cat in picked
+    return cat not in picked
+
+def _daily_summary_day_text(data):
+    if isinstance(data, dict):
+        raw_date = str(data.get("date", "") or "").strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", raw_date):
+            return raw_date
+    return datetime.now().strftime("%Y-%m-%d")
+
+def _merge_daily_summary_payload(day_text, summary_map, expected_codes):
+    target_codes = [str(x).strip().upper() for x in (expected_codes or []) if str(x).strip()]
+    if not target_codes:
+        target_codes = [str(x).strip().upper() for x in summary_map.keys() if str(x).strip()]
+    rows = []
+    for code in target_codes:
+        row = summary_map.get(code)
+        if isinstance(row, dict):
+            rows.append((code, row))
+    if not rows:
+        rows = [(str(code).strip().upper(), row) for code, row in summary_map.items() if isinstance(row, dict)]
+    total_trades = 0
+    total_net_pnl = 0.0
+    max_drawdown = 0.0
+    weighted_win_numerator = 0.0
+    weighted_win_denominator = 0
+    stock_summaries = []
+    for _, row in rows:
+        trades = int(row.get("total_trades", 0) or 0)
+        net_pnl = float(row.get("net_pnl", row.get("realized_pnl", 0.0)) or 0.0)
+        dd = float(row.get("max_drawdown", 0.0) or 0.0)
+        wr = float(row.get("win_rate", 0.0) or 0.0)
+        wr = max(0.0, wr)
+        dd = max(0.0, dd)
+        total_trades += max(0, trades)
+        total_net_pnl += net_pnl
+        max_drawdown = max(max_drawdown, dd)
+        stock_summaries.append({
+            "stock_code": str(row.get("stock_code", "") or "").strip().upper(),
+            "total_trades": int(max(0, trades)),
+            "win_rate": round(float(wr), 2),
+            "net_pnl": round(float(net_pnl), 2),
+            "max_drawdown": round(float(dd), 6)
+        })
+        if trades > 0:
+            weighted_win_numerator += wr * float(trades)
+            weighted_win_denominator += trades
+    if weighted_win_denominator > 0:
+        win_rate = weighted_win_numerator / float(weighted_win_denominator)
+    else:
+        win_rate = 0.0
+    used_codes = [code for code, _ in rows]
+    if len(stock_summaries) != len(used_codes):
+        stock_summaries = []
+        for code, row in rows:
+            trades = int(row.get("total_trades", 0) or 0)
+            net_pnl = float(row.get("net_pnl", row.get("realized_pnl", 0.0)) or 0.0)
+            dd = max(0.0, float(row.get("max_drawdown", 0.0) or 0.0))
+            wr = max(0.0, float(row.get("win_rate", 0.0) or 0.0))
+            stock_summaries.append({
+                "stock_code": str(code).strip().upper(),
+                "total_trades": int(max(0, trades)),
+                "win_rate": round(float(wr), 2),
+                "net_pnl": round(float(net_pnl), 2),
+                "max_drawdown": round(float(dd), 6)
+            })
+    return {
+        "date": day_text,
+        "event_type": "daily_summary",
+        "total_trades": int(total_trades),
+        "win_rate": round(float(win_rate), 2),
+        "net_pnl": round(float(total_net_pnl), 2),
+        "max_drawdown": round(float(max_drawdown), 6),
+        "stock_count": len(used_codes),
+        "stock_codes": used_codes,
+        "stock_summaries": stock_summaries
+    }
+
+async def _notify_daily_summary_once(stock_code, data):
+    global daily_summary_webhook_state
+    if not isinstance(data, dict):
+        if _should_notify_webhook_by_category(event_type="daily_summary", data=data):
+            await webhook_notifier.notify(event_type="daily_summary", data=data, stock_code=stock_code)
+        return
+    code = str(stock_code or "").strip().upper()
+    if not code:
+        code = "MULTI"
+    day_text = _daily_summary_day_text(data)
+    state = daily_summary_webhook_state.get(day_text)
+    if not isinstance(state, dict):
+        state = {"sent": False, "first_seen_at": datetime.now(), "summaries": {}}
+    summaries = state.get("summaries")
+    if not isinstance(summaries, dict):
+        summaries = {}
+    summaries[code] = dict(data)
+    state["summaries"] = summaries
+    if bool(state.get("sent", False)):
+        daily_summary_webhook_state[day_text] = state
+        return
+    running_codes = [str(x or "").strip().upper() for x in _live_running_codes() if str(x or "").strip()]
+    expected_codes = running_codes if running_codes else list(summaries.keys())
+    first_seen_at = state.get("first_seen_at")
+    timed_out = isinstance(first_seen_at, datetime) and (datetime.now() - first_seen_at >= timedelta(seconds=20))
+    has_all = all(code_item in summaries for code_item in expected_codes)
+    if (not has_all) and (not timed_out):
+        daily_summary_webhook_state[day_text] = state
+        return
+    merged = _merge_daily_summary_payload(day_text=day_text, summary_map=summaries, expected_codes=expected_codes)
+    state["sent"] = True
+    daily_summary_webhook_state[day_text] = state
+    if len(daily_summary_webhook_state) > 30:
+        keep_days = set(sorted(daily_summary_webhook_state.keys())[-10:])
+        daily_summary_webhook_state = {k: v for k, v in daily_summary_webhook_state.items() if k in keep_days}
+    notify_stock_code = "MULTI" if len(merged.get("stock_codes", [])) != 1 else str(merged.get("stock_codes")[0] or "MULTI")
+    if _should_notify_webhook_by_category(event_type="daily_summary", data=merged):
+        await webhook_notifier.notify(event_type="daily_summary", data=merged, stock_code=notify_stock_code)
+
+def _resolve_daily_summary_for_manual_repush(day_text=None):
+    day = str(day_text or "").strip()
+    if day:
+        state = daily_summary_webhook_state.get(day)
+        if not isinstance(state, dict):
+            return None, "", f"指定日期无日终汇总缓存: {day}"
+        summaries = state.get("summaries")
+        if not isinstance(summaries, dict) or (not summaries):
+            return None, "", f"指定日期无明细缓存: {day}"
+        payload = _merge_daily_summary_payload(day, summaries, list(summaries.keys()))
+        return payload, day, ""
+    if not daily_summary_webhook_state:
+        return None, "", "暂无可重推的日终汇总缓存"
+    latest_day = sorted(daily_summary_webhook_state.keys())[-1]
+    state = daily_summary_webhook_state.get(latest_day)
+    summaries = state.get("summaries") if isinstance(state, dict) else None
+    if not isinstance(summaries, dict) or (not summaries):
+        return None, "", f"最近日期无明细缓存: {latest_day}"
+    payload = _merge_daily_summary_payload(latest_day, summaries, list(summaries.keys()))
+    return payload, latest_day, ""
+
+def _set_live_last_error(stock_code, stage, err, tb_text=None):
+    global live_last_error
+    err_type = type(err).__name__ if err is not None else "Exception"
+    err_msg = str(err) if err is not None else ""
+    stack_text = tb_text if isinstance(tb_text, str) and tb_text.strip() else traceback.format_exc()
+    live_last_error = {
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "stock_code": str(stock_code or "").upper() or None,
+        "stage": str(stage or "").strip() or None,
+        "error_type": err_type,
+        "error_msg": err_msg,
+        "stack": stack_text
+    }
+
+def _clear_live_last_error():
+    global live_last_error
+    live_last_error = None
+
+def _project_root():
+    """项目根目录。打包模式下使用环境变量或 exe 目录，否则指向 server.py 目录。"""
+    env = (
+        os.environ.get("DESKTOP_CONFIG_DIR", "")
+        or os.environ.get("PROJECT_ROOT", "")
+    )
+    if env:
+        return env
+    if getattr(sys, "_MEIPASS", None):
+        # Windows: sys.executable 在项目根目录
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+def _secret_config_paths(payload=None):
+    try:
+        if isinstance(payload, dict):
+            return ConfigLoader.resolve_private_override_paths(payload)
+        cfg = ConfigLoader.reload()
+        return ConfigLoader.resolve_private_override_paths(cfg.to_dict())
+    except Exception:
+        return set(SECRET_CONFIG_PATHS)
+
+def _private_config_path():
+    override = str(os.environ.get("CONFIG_PRIVATE_PATH", "") or "").strip()
+    if override:
+        return override
+    try:
+        cfg = ConfigLoader.reload()
+        cfg_override = str(cfg.get("system.private_config_path", "") or "").strip()
+        if cfg_override:
+            return cfg_override if os.path.isabs(cfg_override) else os.path.join(_project_root(), cfg_override)
+    except Exception:
+        pass
+    return os.path.join(_project_root(), "config.private.json")
+
+def _custom_private_strategy_path():
+    override = str(os.environ.get("CUSTOM_STRATEGIES_PRIVATE_PATH", "") or "").strip()
+    if override:
+        return override
+    try:
+        cfg = ConfigLoader.reload()
+        cfg_override = str(cfg.get("system.private_strategy_path", "") or "").strip()
+        if cfg_override:
+            return cfg_override if os.path.isabs(cfg_override) else os.path.join(_project_root(), cfg_override)
+    except Exception:
+        pass
+    return os.path.join(_project_root(), "data", "strategies", "custom_strategies.private.json")
+
+def _startup_private_data_check(cfg=None):
+    c = cfg if cfg is not None else ConfigLoader.reload()
+    private_path = _private_config_path()
+    strategy_private_path = _custom_private_strategy_path()
+    required_paths = [
+        "data_provider.default_api_key",
+        "data_provider.tushare_token",
+    ]
+    missing_secrets = []
+    for p in required_paths:
+        val = str(c.get(p, "") or "").strip()
+        if not val:
+            missing_secrets.append(p)
+    if (not os.path.exists(private_path)) or missing_secrets:
+        logger.warning("私有配置检查: CONFIG_PRIVATE_PATH=%s", private_path)
+        if not os.path.exists(private_path):
+            logger.warning("未找到私有配置文件 config.private.json，密钥不会随代码仓库同步。")
+        if missing_secrets:
+            logger.warning("以下关键密钥为空: %s", ",".join(missing_secrets))
+        logger.warning("建议：在目标机器创建私有目录并设置环境变量 CONFIG_PRIVATE_PATH/CUSTOM_STRATEGIES_PRIVATE_PATH。")
+    if not os.path.exists(strategy_private_path):
+        logger.warning("未找到私有策略文件: %s", strategy_private_path)
+        logger.warning("若需私有策略持久化，请创建该文件并设置 CUSTOM_STRATEGIES_WRITE_PRIVATE=1。")
+
+def _load_json_with_comments(file_path, silent=False):
+    import re
+    if not os.path.exists(file_path):
+        return {}
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        pattern = r'("[^"]*")|(\/\/.*)'
+        def replace(match):
+            if match.group(1):
+                return match.group(1)
+            return ""
+        content = re.sub(pattern, replace, content)
+        payload = json.loads(content)
+        return payload if isinstance(payload, dict) else {}
+    except Exception as e:
+        if not silent:
+            logger.error(f"load json failed: {file_path}, {e}")
+        return {}
+
+def _deep_merge_dict(base, override):
+    if not isinstance(base, dict):
+        return override if override is not None else base
+    if not isinstance(override, dict):
+        return dict(base)
+    merged = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = _deep_merge_dict(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
+
+def _path_exists(payload, path):
+    if not isinstance(payload, dict):
+        return False
+    cur = payload
+    for key in str(path).split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return False
+        cur = cur.get(key)
+    return True
+
+def _get_path_value(payload, path, default=None):
+    if not isinstance(payload, dict):
+        return default
+    cur = payload
+    for key in str(path).split("."):
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur.get(key)
+    return cur
+
+def _set_path_value(payload, path, value):
+    if not isinstance(payload, dict):
+        return
+    keys = str(path).split(".")
+    cur = payload
+    for key in keys[:-1]:
+        nxt = cur.get(key)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[key] = nxt
+        cur = nxt
+    cur[keys[-1]] = value
+
+def _delete_path_value(payload, path):
+    if not isinstance(payload, dict):
+        return
+    keys = str(path).split(".")
+    chain = []
+    cur = payload
+    for key in keys:
+        if not isinstance(cur, dict) or key not in cur:
+            return
+        chain.append((cur, key))
+        cur = cur.get(key)
+    parent, last_key = chain[-1]
+    parent.pop(last_key, None)
+    for parent, key in reversed(chain[:-1]):
+        child = parent.get(key)
+        if isinstance(child, dict) and not child:
+            parent.pop(key, None)
+        else:
+            break
+
+def _mask_secret_value(value):
+    text = str(value or "").strip()
+    return SECRET_MASK if text else ""
+
+def _mask_secret_config(payload):
+    masked = json.loads(json.dumps(payload, ensure_ascii=False))
+    for path in _secret_config_paths(masked):
+        val = _get_path_value(masked, path, "")
+        if _path_exists(masked, path):
+            _set_path_value(masked, path, _mask_secret_value(val))
+    return masked
+
+def _is_secret_mask_value(value):
+    return str(value or "").strip() == SECRET_MASK
+
+def _write_json_file(file_path, payload):
+    folder = os.path.dirname(file_path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+def _save_split_config(incoming):
+    incoming_dict = incoming if isinstance(incoming, dict) else {}
+    current_cfg = ConfigLoader.reload().to_dict()
+    merged_cfg = _deep_merge_dict(current_cfg, incoming_dict)
+    secret_paths = _secret_config_paths(merged_cfg)
+    private_only_paths = set(PRIVATE_ONLY_CONFIG_PATHS)
+    public_path = os.path.join(_project_root(), "config.json")
+    existing_public_cfg = _load_json_with_comments(public_path, silent=True)
+    if not isinstance(existing_public_cfg, dict):
+        existing_public_cfg = {}
+    private_path = _private_config_path()
+    private_exists = os.path.exists(private_path)
+
+    secret_updates = {}
+    for path in secret_paths:
+        if not _path_exists(incoming_dict, path):
+            continue
+        val = _get_path_value(incoming_dict, path, "")
+        if isinstance(val, str) and _is_secret_mask_value(val):
+            continue
+        secret_updates[path] = val
+    private_only_updates = {}
+    for path in private_only_paths:
+        if not _path_exists(incoming_dict, path):
+            continue
+        if not private_exists:
+            continue
+        private_only_updates[path] = _get_path_value(incoming_dict, path, [])
+
+    public_cfg = json.loads(json.dumps(merged_cfg, ensure_ascii=False))
+    for path in secret_paths:
+        if not private_exists:
+            continue
+        _set_path_value(public_cfg, path, "")
+    for path in private_only_paths:
+        if private_exists:
+            if _path_exists(existing_public_cfg, path):
+                _set_path_value(public_cfg, path, _get_path_value(existing_public_cfg, path, None))
+            else:
+                _delete_path_value(public_cfg, path)
+            continue
+
+    _write_json_file(public_path, public_cfg)
+
+    if not private_exists:
+        return ConfigLoader.reload()
+
+    if secret_updates or private_only_updates:
+        private_cfg = _load_json_with_comments(private_path, silent=True)
+        if not isinstance(private_cfg, dict):
+            private_cfg = {}
+        private_changed = False
+        for path, val in secret_updates.items():
+            text = str(val or "")
+            old_val = _get_path_value(private_cfg, path, "")
+            # Incremental upsert only: empty value means "no change".
+            if not text.strip():
+                continue
+            if str(old_val) != text:
+                _set_path_value(private_cfg, path, text)
+                private_changed = True
+        for path, val in private_only_updates.items():
+            old_val = _get_path_value(private_cfg, path, None)
+            if old_val != val:
+                _set_path_value(private_cfg, path, val)
+                private_changed = True
+        if private_changed:
+            _write_json_file(private_path, private_cfg)
+
+    return ConfigLoader.reload()
+
+def is_live_enabled():
+    cfg = ConfigLoader.reload()
+    return _system_mode(cfg) == "live"
+
+def _build_provider_by_source(source: str, cfg=None):
+    c = cfg if cfg is not None else ConfigLoader.reload()
+    s = str(source or "default").strip().lower()
+    if s == "tushare":
+        return TushareProvider(token=c.get("data_provider.tushare_token"))
+    if s == "akshare":
+        return AkshareProvider()
+    if s == "mysql":
+        return MysqlProvider()
+    if s == "postgresql":
+        return PostgresProvider()
+    if s == "duckdb":
+        return DuckDbProvider()
+    if s == "tdx":
+        return TdxProvider()
+    return DataProvider(
+        api_key=c.get("data_provider.default_api_key", ""),
+        base_url=c.get("data_provider.default_api_url", "")
+    )
+
+def _check_provider_connectivity_for_code(provider, provider_source: str, stock_code: str):
+    src = str(provider_source or "default").strip().lower()
+    code = str(stock_code or "").strip()
+    if not code:
+        return False, "stock_code 为空"
+    try:
+        if hasattr(provider, "check_connectivity"):
+            ok, msg = provider.check_connectivity(code)
+            return bool(ok), str(msg or "")
+        if src == "tushare":
+            pro = getattr(provider, "pro", None)
+            if pro is None:
+                return False, "tushare_token 未配置"
+            now = datetime.now()
+            start_time = now - timedelta(days=3)
+            pro.stk_mins(
+                ts_code=code,
+                freq="1min",
+                start_date=start_time.strftime("%Y-%m-%d %H:%M:%S"),
+                end_date=now.strftime("%Y-%m-%d %H:%M:%S")
+            )
+            return True, "ok"
+        if src == "akshare":
+            bar = provider.get_latest_bar(code)
+            if bar:
+                return True, "ok"
+            return False, "akshare 连通性检查失败（未返回最新行情）"
+        return False, f"未知数据源: {src}"
+    except Exception as e:
+        return False, str(e)
+
+async def _emit_backtest_precheck_progress(progress: int, phase_label: str, period_text: str, broadcast_ws: bool = True):
+    await emit_event_to_ws("backtest_progress", {
+        "progress": int(progress),
+        "phase": "data_fetch",
+        "phase_label": phase_label,
+        "current_date": period_text
+    }, broadcast_ws=broadcast_ws)
+
+async def _run_backtest_provider_precheck(stock_code: str, start: Optional[str], end: Optional[str], broadcast_ws: bool = True):
+    cfg = ConfigLoader.reload()
+    provider_source = str(cfg.get("data_provider.source", "default") or "default").strip().lower()
+    period_text = f"{start or '--'} ~ {end or '--'}"
+    await _emit_backtest_precheck_progress(1, "回测启动前检查", period_text, broadcast_ws=broadcast_ws)
+    await emit_event_to_ws("backtest_flow", {
+        "module": "工部",
+        "level": "system",
+        "msg": f"回测启动前数据源检测：source={provider_source} code={stock_code}"
+    }, broadcast_ws=broadcast_ws)
+    provider = _build_provider_by_source(provider_source, cfg=cfg)
+    await _emit_backtest_precheck_progress(3, "检查数据源连通性", period_text, broadcast_ws=broadcast_ws)
+    ok, reason = await asyncio.to_thread(_check_provider_connectivity_for_code, provider, provider_source, stock_code)
+    if ok:
+        await emit_event_to_ws("backtest_flow", {
+            "module": "工部",
+            "level": "success",
+            "msg": f"数据源连通性检测通过：source={provider_source}"
+        }, broadcast_ws=broadcast_ws)
+        await _emit_backtest_precheck_progress(5, "连通性检测通过，准备启动回测", period_text, broadcast_ws=broadcast_ws)
+        return True, provider_source, "ok"
+    await emit_event_to_ws("backtest_flow", {
+        "module": "工部",
+        "level": "warning",
+        "msg": f"数据源连通性检测失败：source={provider_source} reason={reason}"
+    }, broadcast_ws=broadcast_ws)
+    await emit_event_to_ws("backtest_failed", {
+        "msg": f"回测启动前连通性检测失败：source={provider_source} reason={reason}",
+        "stock": stock_code,
+        "provider_source": provider_source,
+        "stage": "startup_precheck"
+    }, broadcast_ws=broadcast_ws)
+    return False, provider_source, str(reason or "")
+
+def _iter_report_file_paths():
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    files = []
+    try:
+        for entry in os.scandir(REPORTS_DIR):
+            if not entry.is_file():
+                continue
+            name = str(entry.name or "")
+            if name.startswith(REPORT_FILE_PREFIX) and name.endswith(REPORT_FILE_SUFFIX):
+                files.append(entry.path)
+    except Exception:
+        return []
+    return files
+
+def _build_report_storage_signature():
+    paths = _iter_report_file_paths()
+    latest_mtime = 0.0
+    total_size = 0
+    for path in paths:
+        try:
+            st = os.stat(path)
+            latest_mtime = max(latest_mtime, float(st.st_mtime))
+            total_size += int(st.st_size)
+        except Exception:
+            continue
+    legacy_mtime = os.path.getmtime(REPORTS_LEGACY_FILE) if os.path.exists(REPORTS_LEGACY_FILE) else 0.0
+    legacy_size = os.path.getsize(REPORTS_LEGACY_FILE) if os.path.exists(REPORTS_LEGACY_FILE) else 0
+    return (len(paths), float(latest_mtime), int(total_size), float(legacy_mtime), int(legacy_size))
+
+def _load_report_item(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            if isinstance(payload.get("report"), dict):
+                return payload.get("report")
+            if isinstance(payload.get("reports"), list):
+                rows = payload.get("reports")
+                if rows and isinstance(rows[0], dict):
+                    return rows[0]
+            if payload.get("report_id"):
+                return payload
+    except Exception as e:
+        logger.warning("failed to load report item path=%s err=%s", path, e)
+    return None
+
+def _report_file_path(report_id):
+    rid = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(report_id or "").strip())
+    if not rid:
+        rid = f"{int(datetime.now().timestamp() * 1000)}-{os.urandom(2).hex()}"
+    return os.path.join(REPORTS_DIR, f"{REPORT_FILE_PREFIX}{rid}{REPORT_FILE_SUFFIX}")
+
+
+def _ensure_evolution_storage_dirs():
+    os.makedirs(EVOLUTION_RUNS_DIR, exist_ok=True)
+    os.makedirs(EVOLUTION_FAMILY_DIR, exist_ok=True)
+
+
+def _sanitize_file_key(raw: Any, fallback_prefix: str) -> str:
+    text = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(raw or "").strip())
+    if text:
+        return text
+    return f"{fallback_prefix}_{int(datetime.now().timestamp() * 1000)}_{os.urandom(2).hex()}"
+
+
+def _iter_prefixed_json_paths(directory: str, prefix: str) -> List[str]:
+    os.makedirs(directory, exist_ok=True)
+    files: List[str] = []
+    try:
+        for entry in os.scandir(directory):
+            if not entry.is_file():
+                continue
+            name = str(entry.name or "")
+            if name.startswith(prefix) and name.endswith(EVOLUTION_FILE_SUFFIX):
+                files.append(entry.path)
+    except Exception:
+        return []
+    return files
+
+
+def _evolution_run_file_path(run_id: Any) -> str:
+    return os.path.join(EVOLUTION_RUNS_DIR, f"{EVOLUTION_RUN_FILE_PREFIX}{_sanitize_file_key(run_id, 'run')}{EVOLUTION_FILE_SUFFIX}")
+
+
+def _evolution_family_file_path(family: Any) -> str:
+    return os.path.join(EVOLUTION_FAMILY_DIR, f"{EVOLUTION_FAMILY_FILE_PREFIX}{_sanitize_file_key(family, 'family')}{EVOLUTION_FILE_SUFFIX}")
+
+
+def _load_json_file(path: str) -> Optional[Dict[str, Any]]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else None
+    except Exception as e:
+        logger.warning("failed to load json file path=%s err=%s", path, e)
+        return None
+
+
+def _write_json_file(path: str, payload: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_sanitize_non_finite(payload), f, ensure_ascii=False, indent=2, default=str)
+
+
+def _remove_file_if_exists(path: str) -> bool:
+    if not os.path.exists(path):
+        return False
+    os.remove(path)
+    return True
+
+
+def _parse_iso_like(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _normalize_time_text(value: Any, fallback: str = "") -> str:
+    text = str(value or fallback or "").strip()
+    dt = _parse_iso_like(text)
+    if dt is not None:
+        return dt.isoformat()
+    return text or datetime.now().isoformat(timespec="seconds")
+
+
+def _normalize_evolution_run_row(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    data = dict(existing or {})
+    if isinstance(payload, dict):
+        data.update(payload)
+    analysis = data.get("analysis") if isinstance(data.get("analysis"), dict) else {}
+    run_id = str(data.get("run_id", "") or "").strip() or _sanitize_file_key("", "run")
+    child_gene_family = str(data.get("child_gene_family", "") or data.get("family", "") or "unknown").strip().lower() or "unknown"
+    now = datetime.now().isoformat(timespec="seconds")
+    row = {
+        "run_id": run_id,
+        "iteration": int(data.get("iteration", 0) or 0),
+        "status": str(data.get("status", "ok") or "ok").strip().lower(),
+        "score": float(data.get("score")) if data.get("score") is not None and str(data.get("score", "")).strip() != "" else None,
+        "strategy_id": str(data.get("strategy_id", "") or "").strip(),
+        "strategy_name": str(data.get("strategy_name", "") or "").strip(),
+        "parent_strategy_id": str(data.get("parent_strategy_id", "") or "").strip(),
+        "parent_strategy_name": str(data.get("parent_strategy_name", "") or "").strip(),
+        "child_gene_id": str(data.get("child_gene_id", "") or "").strip(),
+        "child_gene_parent_ids": [str(x or "").strip() for x in (data.get("child_gene_parent_ids") or []) if str(x or "").strip()],
+        "child_gene_fingerprint": str(data.get("child_gene_fingerprint", "") or "").strip(),
+        "child_gene_family": child_gene_family,
+        "metrics": data.get("metrics") if isinstance(data.get("metrics"), dict) else {},
+        "profile": data.get("profile") if isinstance(data.get("profile"), dict) else {},
+        "strategy_code_sha256": str(data.get("strategy_code_sha256", "") or "").strip(),
+        "committed_strategy_id": str(data.get("committed_strategy_id", "") or "").strip(),
+        "committed_strategy_name": str(data.get("committed_strategy_name", "") or "").strip(),
+        "committed_version": int(data.get("committed_version", 0) or 0),
+        "committed_at": _normalize_time_text(data.get("committed_at"), "") if str(data.get("committed_at", "")).strip() else "",
+        "analysis_id": str(data.get("analysis_id", "") or analysis.get("analysis_id", "") or "").strip(),
+        "analysis_status": str(data.get("analysis_status", "") or analysis.get("analysis_status", "") or "").strip(),
+        "analysis_version": str(data.get("analysis_version", "") or analysis.get("analysis_version", "") or "").strip(),
+        "analysis_summary": str(data.get("analysis_summary", "") or analysis.get("analysis_summary", "") or "").strip(),
+        "analysis_source": str(data.get("analysis_source", "") or analysis.get("analysis_source", "") or "").strip(),
+        "analysis_confidence": float(data.get("analysis_confidence")) if data.get("analysis_confidence") is not None and str(data.get("analysis_confidence", "")).strip() != "" else (float(analysis.get("confidence")) if analysis.get("confidence") is not None and str(analysis.get("confidence", "")).strip() != "" else None),
+        "feedback_tags": [str(x or "").strip() for x in (data.get("feedback_tags") or analysis.get("feedback_tags") or []) if str(x or "").strip()],
+        "improvement_suggestions": data.get("improvement_suggestions") if isinstance(data.get("improvement_suggestions"), list) else (analysis.get("improvement_suggestions") if isinstance(analysis.get("improvement_suggestions"), list) else []),
+        "prompt_context_patch": data.get("prompt_context_patch") if isinstance(data.get("prompt_context_patch"), dict) else (analysis.get("prompt_context_patch") if isinstance(analysis.get("prompt_context_patch"), dict) else {}),
+        "consistency_report_id": str(data.get("consistency_report_id", "") or analysis.get("consistency_report_id", "") or "").strip(),
+        "llm_analysis_provider": str(data.get("llm_analysis_provider", "") or analysis.get("llm_provider", "") or "").strip(),
+        "llm_analysis_model": str(data.get("llm_analysis_model", "") or analysis.get("llm_model", "") or "").strip(),
+        "created_at": _normalize_time_text(data.get("created_at"), data.get("time") or now),
+        "updated_at": _normalize_time_text(data.get("updated_at"), now),
+        "note": str(data.get("note", "") or "").strip(),
+    }
+    return row
+
+
+def _normalize_evolution_family_row(payload: Dict[str, Any], existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    data = dict(existing or {})
+    if isinstance(payload, dict):
+        data.update(payload)
+    family = str(data.get("family", "") or "unknown").strip().lower() or "unknown"
+    now = datetime.now().isoformat(timespec="seconds")
+    row = {
+        "family": family,
+        "run_count": int(data.get("run_count", data.get("sample_count", 0)) or 0),
+        "sample_count": int(data.get("run_count", data.get("sample_count", 0)) or 0),
+        "avg_score": float(data.get("avg_score", 0.0) or 0.0),
+        "avg_sharpe": float(data.get("avg_sharpe", 0.0) or 0.0),
+        "avg_drawdown": float(data.get("avg_drawdown", 0.0) or 0.0),
+        "note": str(data.get("note", "") or "").strip(),
+        "created_at": _normalize_time_text(data.get("created_at"), now),
+        "updated_at": _normalize_time_text(data.get("updated_at"), now),
+    }
+    return row
+
+
+def _load_all_evolution_run_rows() -> List[Dict[str, Any]]:
+    _ensure_evolution_storage_dirs()
+    rows: List[Dict[str, Any]] = []
+    for path in _iter_prefixed_json_paths(EVOLUTION_RUNS_DIR, EVOLUTION_RUN_FILE_PREFIX):
+        payload = _load_json_file(path) or {}
+        row = payload.get("run") if isinstance(payload.get("run"), dict) else payload
+        if isinstance(row, dict):
+            rows.append(_normalize_evolution_run_row(row))
+    rows.sort(key=lambda x: (str(x.get("created_at") or ""), str(x.get("run_id") or "")), reverse=True)
+    return rows
+
+
+def _load_all_evolution_family_rows() -> List[Dict[str, Any]]:
+    _ensure_evolution_storage_dirs()
+    rows: List[Dict[str, Any]] = []
+    for path in _iter_prefixed_json_paths(EVOLUTION_FAMILY_DIR, EVOLUTION_FAMILY_FILE_PREFIX):
+        payload = _load_json_file(path) or {}
+        row = payload.get("family") if isinstance(payload.get("family"), dict) else payload
+        if isinstance(row, dict):
+            rows.append(_normalize_evolution_family_row(row))
+    rows.sort(key=lambda x: (str(x.get("updated_at") or ""), str(x.get("family") or "")), reverse=True)
+    return rows
+
+
+def _save_evolution_run_row(payload: Dict[str, Any], original_run_id: str = "") -> Dict[str, Any]:
+    _ensure_evolution_storage_dirs()
+    existing = None
+    source_id = str(original_run_id or payload.get("run_id") or "").strip()
+    if source_id:
+        existing_payload = _load_json_file(_evolution_run_file_path(source_id)) or {}
+        existing = existing_payload.get("run") if isinstance(existing_payload.get("run"), dict) else existing_payload
+    row = _normalize_evolution_run_row(payload, existing=existing if isinstance(existing, dict) else None)
+    if source_id and source_id != row["run_id"]:
+        try:
+            _remove_file_if_exists(_evolution_run_file_path(source_id))
+        except Exception:
+            pass
+    _write_json_file(_evolution_run_file_path(row["run_id"]), {"run": row})
+    return row
+
+
+def _save_evolution_family_row(payload: Dict[str, Any], original_family: str = "") -> Dict[str, Any]:
+    _ensure_evolution_storage_dirs()
+    existing = None
+    source_key = str(original_family or payload.get("family") or "").strip().lower()
+    if source_key:
+        existing_payload = _load_json_file(_evolution_family_file_path(source_key)) or {}
+        existing = existing_payload.get("family") if isinstance(existing_payload.get("family"), dict) else existing_payload
+    row = _normalize_evolution_family_row(payload, existing=existing if isinstance(existing, dict) else None)
+    if source_key and source_key != row["family"]:
+        try:
+            _remove_file_if_exists(_evolution_family_file_path(source_key))
+        except Exception:
+            pass
+    _write_json_file(_evolution_family_file_path(row["family"]), {"family": row})
+    return row
+
+
+def _delete_evolution_run_row(run_id: str) -> bool:
+    _ensure_evolution_storage_dirs()
+    return _remove_file_if_exists(_evolution_run_file_path(run_id))
+
+
+def _delete_evolution_family_row(family: str) -> bool:
+    _ensure_evolution_storage_dirs()
+    return _remove_file_if_exists(_evolution_family_file_path(family))
+
+
+def _query_evolution_run_rows(limit: int = 100, offset: int = 0, run_id: str = "", child_gene_id: str = "", status: str = "", parent_strategy_id: str = "", start_time: str = "", end_time: str = "") -> Dict[str, Any]:
+    rows = _load_all_evolution_run_rows()
+    start_dt = _parse_iso_like(start_time)
+    end_dt = _parse_iso_like(end_time)
+    filtered: List[Dict[str, Any]] = []
+    for row in rows:
+        if run_id and str(row.get("run_id", "")).strip() != str(run_id).strip():
+            continue
+        if child_gene_id and str(row.get("child_gene_id", "")).strip() != str(child_gene_id).strip():
+            continue
+        if status and str(row.get("status", "")).strip().lower() != str(status).strip().lower():
+            continue
+        if parent_strategy_id and str(row.get("parent_strategy_id", "")).strip() != str(parent_strategy_id).strip():
+            continue
+        created_dt = _parse_iso_like(row.get("created_at"))
+        if start_dt and created_dt and created_dt < start_dt:
+            continue
+        if end_dt and created_dt and created_dt > end_dt:
+            continue
+        filtered.append(row)
+    total = len(filtered)
+    safe_offset = max(0, int(offset or 0))
+    safe_limit = max(1, min(int(limit or 100), 500))
+    return {
+        "rows": filtered[safe_offset:safe_offset + safe_limit],
+        "count": total,
+        "limit": safe_limit,
+        "offset": safe_offset,
+        "enabled": True,
+        "error": "",
+    }
+
+
+def _build_family_stats_from_runs(run_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    stats: Dict[str, Dict[str, Any]] = {}
+    for row in run_rows:
+        family = str(row.get("child_gene_family", "") or "unknown").strip().lower() or "unknown"
+        bucket = stats.setdefault(family, {
+            "family": family,
+            "run_count": 0,
+            "sample_count": 0,
+            "score_sum": 0.0,
+            "score_count": 0,
+            "sharpe_sum": 0.0,
+            "sharpe_count": 0,
+            "drawdown_sum": 0.0,
+            "drawdown_count": 0,
+            "updated_at": "",
+        })
+        bucket["run_count"] += 1
+        bucket["sample_count"] += 1
+        score = row.get("score")
+        if score is not None:
+            try:
+                bucket["score_sum"] += float(score)
+                bucket["score_count"] += 1
+            except Exception:
+                pass
+        metrics = row.get("metrics") if isinstance(row.get("metrics"), dict) else {}
+        sharpe = metrics.get("sharpe")
+        drawdown = metrics.get("drawdown")
+        try:
+            if sharpe is not None:
+                bucket["sharpe_sum"] += float(sharpe)
+                bucket["sharpe_count"] += 1
+        except Exception:
+            pass
+        try:
+            if drawdown is not None:
+                bucket["drawdown_sum"] += float(drawdown)
+                bucket["drawdown_count"] += 1
+        except Exception:
+            pass
+        updated_at = str(row.get("updated_at") or row.get("created_at") or "")
+        if updated_at > str(bucket.get("updated_at") or ""):
+            bucket["updated_at"] = updated_at
+    out: List[Dict[str, Any]] = []
+    for bucket in stats.values():
+        run_count = int(bucket.get("run_count", 0) or 0)
+        score_count = max(1, int(bucket.get("score_count", 0) or 0)) if int(bucket.get("score_count", 0) or 0) > 0 else 0
+        sharpe_count = max(1, int(bucket.get("sharpe_count", 0) or 0)) if int(bucket.get("sharpe_count", 0) or 0) > 0 else 0
+        drawdown_count = max(1, int(bucket.get("drawdown_count", 0) or 0)) if int(bucket.get("drawdown_count", 0) or 0) > 0 else 0
+        out.append({
+            "family": bucket.get("family", "unknown"),
+            "run_count": run_count,
+            "sample_count": run_count,
+            "avg_score": (bucket.get("score_sum", 0.0) / score_count) if score_count else 0.0,
+            "avg_sharpe": (bucket.get("sharpe_sum", 0.0) / sharpe_count) if sharpe_count else 0.0,
+            "avg_drawdown": (bucket.get("drawdown_sum", 0.0) / drawdown_count) if drawdown_count else 0.0,
+            "updated_at": bucket.get("updated_at", ""),
+            "note": "",
+        })
+    out.sort(key=lambda x: (str(x.get("updated_at") or ""), str(x.get("family") or "")), reverse=True)
+    return out
+
+
+def _query_evolution_family_rows(limit: int = 100, offset: int = 0, family: str = "", start_time: str = "", end_time: str = "") -> Dict[str, Any]:
+    file_rows = _load_all_evolution_family_rows()
+    if not file_rows:
+        file_rows = _build_family_stats_from_runs(_load_all_evolution_run_rows())
+    start_dt = _parse_iso_like(start_time)
+    end_dt = _parse_iso_like(end_time)
+    filtered: List[Dict[str, Any]] = []
+    family_text = str(family or "").strip().lower()
+    for row in file_rows:
+        if family_text and family_text not in str(row.get("family", "")).strip().lower():
+            continue
+        updated_dt = _parse_iso_like(row.get("updated_at") or row.get("created_at"))
+        if start_dt and updated_dt and updated_dt < start_dt:
+            continue
+        if end_dt and updated_dt and updated_dt > end_dt:
+            continue
+        filtered.append(row)
+    total = len(filtered)
+    safe_offset = max(0, int(offset or 0))
+    safe_limit = max(1, min(int(limit or 100), 500))
+    return {
+        "rows": filtered[safe_offset:safe_offset + safe_limit],
+        "count": total,
+        "limit": safe_limit,
+        "offset": safe_offset,
+        "enabled": True,
+        "error": "",
+    }
+
+
+def _persist_evolution_runtime_event(event: Dict[str, Any]) -> None:
+    payload = event if isinstance(event, dict) else {}
+    event_type = str(payload.get("event_type", "") or "").strip().lower()
+    body = payload.get("payload", {}) if isinstance(payload.get("payload"), dict) else {}
+    if event_type == "strategyscored":
+        try:
+            existing_analysis = EVOLUTION_ANALYSIS_STORE.get_analysis_by_run_id(str(body.get("run_id", "") or "")) or {}
+            merged_body = dict(body)
+            if existing_analysis:
+                merged_body.update({
+                    "analysis_id": existing_analysis.get("analysis_id", ""),
+                    "analysis_status": existing_analysis.get("analysis_status", ""),
+                    "analysis_version": existing_analysis.get("analysis_version", ""),
+                    "analysis_summary": existing_analysis.get("analysis_summary", ""),
+                    "analysis_source": existing_analysis.get("analysis_source", ""),
+                    "analysis_confidence": existing_analysis.get("confidence"),
+                    "feedback_tags": existing_analysis.get("feedback_tags", []),
+                    "improvement_suggestions": existing_analysis.get("improvement_suggestions", []),
+                    "prompt_context_patch": existing_analysis.get("prompt_context_patch", {}),
+                    "consistency_report_id": existing_analysis.get("consistency_report_id", ""),
+                    "llm_analysis_provider": existing_analysis.get("llm_provider", ""),
+                    "llm_analysis_model": existing_analysis.get("llm_model", ""),
+                    "analysis": existing_analysis,
+                })
+            row = _save_evolution_run_row(merged_body)
+            if row.get("child_gene_family"):
+                family_rows = _build_family_stats_from_runs(_load_all_evolution_run_rows())
+                for family_row in family_rows:
+                    _save_evolution_family_row(family_row, original_family=str(family_row.get("family") or ""))
+        except Exception as e:
+            logger.warning("persist evolution scored event failed: %s", e)
+    elif event_type == "strategyanalyzed":
+        run_id = str(body.get("run_id", "") or "").strip()
+        if not run_id:
+            return
+        try:
+            EVOLUTION_ANALYSIS_STORE.save_analysis(body)
+            existing_payload = _load_json_file(_evolution_run_file_path(run_id)) or {}
+            existing_row = existing_payload.get("run") if isinstance(existing_payload.get("run"), dict) else existing_payload
+            merged = dict(existing_row or {})
+            merged.update({
+                "run_id": run_id,
+                "analysis_id": body.get("analysis_id", ""),
+                "analysis_status": body.get("analysis_status", ""),
+                "analysis_version": body.get("analysis_version", ""),
+                "analysis_summary": body.get("analysis_summary", ""),
+                "analysis_source": body.get("analysis_source", ""),
+                "analysis_confidence": body.get("confidence"),
+                "feedback_tags": body.get("feedback_tags", []),
+                "improvement_suggestions": body.get("improvement_suggestions", []),
+                "prompt_context_patch": body.get("prompt_context_patch", {}),
+                "consistency_report_id": body.get("consistency_report_id", ""),
+                "llm_analysis_provider": body.get("llm_provider", ""),
+                "llm_analysis_model": body.get("llm_model", ""),
+                "analysis": body,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            })
+            _save_evolution_run_row(merged, original_run_id=run_id)
+        except Exception as e:
+            logger.warning("persist evolution analysis event failed: %s", e)
+    elif event_type == "strategycommitted":
+        run_id = str(body.get("run_id", "") or "").strip()
+        if not run_id:
+            return
+        try:
+            existing_payload = _load_json_file(_evolution_run_file_path(run_id)) or {}
+            existing_row = existing_payload.get("run") if isinstance(existing_payload.get("run"), dict) else existing_payload
+            merged = dict(existing_row or {})
+            merged.update({
+                "run_id": run_id,
+                "committed_strategy_id": body.get("strategy_id", ""),
+                "committed_strategy_name": body.get("strategy_name", ""),
+                "committed_version": body.get("version", 0),
+                "committed_at": datetime.now().isoformat(timespec="seconds"),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            })
+            _save_evolution_run_row(merged, original_run_id=run_id)
+        except Exception as e:
+            logger.warning("persist evolution committed event failed: %s", e)
+
+def load_report_history(force=False):
+    global report_history, latest_backtest_result, latest_strategy_reports, report_history_mtime, report_detail_cache
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    try:
+        signature = _build_report_storage_signature()
+        if (not force) and (report_history_mtime is not None) and report_history_mtime == signature:
+            return
+        rows = []
+        for path in _iter_report_file_paths():
+            rep = _load_report_item(path)
+            if isinstance(rep, dict):
+                rows.append(rep)
+        if (not rows) and os.path.exists(REPORTS_LEGACY_FILE):
+            with open(REPORTS_LEGACY_FILE, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            legacy_rows = payload.get("reports", [])
+            if isinstance(legacy_rows, list):
+                for rep in legacy_rows:
+                    if isinstance(rep, dict):
+                        rows.append(rep)
+        rows = sorted(
+            rows,
+            key=lambda x: (
+                str(x.get("created_at") or ""),
+                str(x.get("report_id") or "")
+            ),
+            reverse=True
+        )
+        report_history = rows
+        report_history_mtime = signature
+        report_detail_cache = {}
+        if report_history:
+            latest = report_history[0]
+            latest_backtest_result = latest.get("summary")
+            latest_strategy_reports = latest.get("strategy_reports", {})
+        _rebuild_strategy_score_cache()
+    except Exception as e:
+        logger.error(f"Failed to load report history: {e}")
+        report_history = []
+        report_history_mtime = None
+        report_detail_cache = {}
+        _rebuild_strategy_score_cache()
+
+def persist_report_history():
+    global report_history_mtime, report_detail_cache
+    os.makedirs(REPORTS_DIR, exist_ok=True)
+    keep_paths = set()
+    for rep in report_history if isinstance(report_history, list) else []:
+        if not isinstance(rep, dict):
+            continue
+        rid = str(rep.get("report_id") or "").strip()
+        if not rid:
+            rid = f"{int(datetime.now().timestamp() * 1000)}-{os.urandom(2).hex()}"
+            rep["report_id"] = rid
+        path = _report_file_path(rid)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"report": rep}, f, ensure_ascii=False, indent=2, default=str)
+        keep_paths.add(os.path.abspath(path))
+    for path in _iter_report_file_paths():
+        abs_path = os.path.abspath(path)
+        if abs_path in keep_paths:
+            continue
+        try:
+            os.remove(abs_path)
+        except Exception:
+            pass
+    report_history_mtime = _build_report_storage_signature()
+    report_detail_cache = {}
+
+
+def _score_grade(score):
+    s = float(score or 0.0)
+    if s >= 90:
+        return "S"
+    if s >= 75:
+        return "A"
+    if s >= 60:
+        return "B"
+    return "C"
+
+
+def _sample_size_penalty_points(count):
+    c = int(count or 0)
+    if c >= 12:
+        return 0.0
+    if c >= 8:
+        return 1.0
+    if c >= 5:
+        return 3.0
+    if c >= 3:
+        return 5.0
+    if c >= 2:
+        return 8.0
+    return 12.0
+
+
+def _sample_size_confidence(count):
+    c = int(count or 0)
+    if c >= 12:
+        return 1.0
+    if c >= 8:
+        return 0.9
+    if c >= 5:
+        return 0.75
+    if c >= 3:
+        return 0.6
+    if c >= 2:
+        return 0.45
+    return 0.3
+
+
+def _normalize_text_list(values) -> list[str]:
+    out = []
+    for value in list(values or []):
+        text = str(value or "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _sanitize_compare_scope_summary(code: str, start_date: str, end_date: str, strategy_ids=None, timeframes=None, snapshot_ids=None) -> str:
+    strategy_text = "、".join(_normalize_text_list(strategy_ids)) or "全部策略"
+    timeframe_text = "、".join(_normalize_text_list(timeframes)) or "全部周期"
+    snapshot_count = len(_normalize_text_list(snapshot_ids))
+    date_text = start_date if start_date == end_date else f"{start_date} ~ {end_date}"
+    scope = f"祖宗 {code}，区间 {date_text}，策略 {strategy_text}，周期 {timeframe_text}"
+    if snapshot_count > 0:
+        scope += f"，共 {snapshot_count} 份实盘样本"
+    return scope
+
+
+def _build_consistency_snapshot_detail(replay_request: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(replay_request, dict):
+        return {}
+    detail = replay_request.get("snapshot_detail")
+    return detail if isinstance(detail, dict) else {}
+
+
+def _build_consistency_report_payload(
+    *,
+    market: str,
+    code: str,
+    replay_run_id: str,
+    snapshot_ids: list[str],
+    snapshot_detail: Dict[str, Any],
+    replay_result: Dict[str, Any],
+    backtest_source_type: str,
+    selected_report_id: str = "",
+    linked_report_id: str = "",
+    selected_strategy_ids=None,
+    comparison_scope_summary: str = "",
+    note: str = "",
+) -> Dict[str, Any]:
+    primary_snapshot_id = str(snapshot_ids[0] if snapshot_ids else "")
+    report_payload = consistency_report_builder.build_report(
+        market=market,
+        code=code,
+        snapshot_id=primary_snapshot_id,
+        replay_run_id=replay_run_id,
+        snapshot_detail=snapshot_detail,
+        replay_result=replay_result,
+    )
+    linked_rid = str(linked_report_id or selected_report_id or replay_result.get("report_id", "") or "")
+    summary = report_payload.get("summary") if isinstance(report_payload.get("summary"), dict) else {}
+    summary["comparison_mode"] = "manual_compare"
+    summary["note"] = str(note or "")
+    summary["backtest_source_type"] = str(backtest_source_type or "")
+    summary["comparison_scope_summary"] = str(comparison_scope_summary or "")
+    summary["selected_strategy_ids"] = _normalize_text_list(selected_strategy_ids)
+    summary["selected_snapshot_ids"] = _normalize_text_list(snapshot_ids)
+    summary["snapshot_count"] = len(_normalize_text_list(snapshot_ids))
+    if selected_report_id:
+        summary["selected_report_id"] = str(selected_report_id)
+    if linked_rid:
+        summary["linked_report_id"] = linked_rid
+    report_payload["summary"] = summary
+    report_payload["backtest_source_type"] = str(backtest_source_type or "")
+    report_payload["selected_report_id"] = str(selected_report_id or "")
+    report_payload["linked_report_id"] = linked_rid
+    report_payload["selected_strategy_ids"] = _normalize_text_list(selected_strategy_ids)
+    report_payload["selected_snapshot_ids"] = _normalize_text_list(snapshot_ids)
+    report_payload["snapshot_count"] = len(_normalize_text_list(snapshot_ids))
+    report_payload["comparison_scope_summary"] = str(comparison_scope_summary or "")
+    report_payload["comparison_mode"] = "manual_compare"
+    report_payload["note"] = str(note or "")
+    return report_payload
+
+
+def _find_latest_consistency_report_for_backtest(linked_report_id: str) -> Dict[str, Any]:
+    rid = str(linked_report_id or "").strip()
+    if not rid:
+        return {}
+    payload = consistency_report_store.list_reports(page=1, page_size=200)
+    items = payload.get("items", []) if isinstance(payload, dict) else []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        candidate = str(item.get("linked_report_id", "") or item.get("selected_report_id", "") or "").strip()
+        if candidate != rid:
+            continue
+        detail = consistency_report_store.get_report(str(item.get("report_id", "") or ""))
+        if isinstance(detail, dict) and detail:
+            return detail
+    return {}
+
+
+def _build_report_consistency_summary(report_item: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(report_item, dict):
+        return {}
+    report_id = str(report_item.get("report_id", "") or "").strip()
+    request = report_item.get("request") if isinstance(report_item.get("request"), dict) else {}
+    linked = _find_latest_consistency_report_for_backtest(report_id)
+    if not linked and str(request.get("mode", "") or "").strip().lower() == "consistency_compare":
+        selected = str(request.get("selected_report_id", "") or report_id).strip()
+        linked = _find_latest_consistency_report_for_backtest(selected)
+    if not isinstance(linked, dict) or not linked:
+        return {}
+    summary = linked.get("summary") if isinstance(linked.get("summary"), dict) else {}
+    first_divergence = linked.get("first_divergence") if isinstance(linked.get("first_divergence"), dict) else {}
+    root_cause_candidates = linked.get("root_cause_candidates") if isinstance(linked.get("root_cause_candidates"), list) else []
+    top_candidate = root_cause_candidates[0] if root_cause_candidates and isinstance(root_cause_candidates[0], dict) else {}
+    out = {
+        "consistency_report_id": str(linked.get("report_id", "") or ""),
+        "comparison_scope_summary": str(linked.get("comparison_scope_summary", "") or summary.get("comparison_scope_summary", "") or ""),
+        "comparison_mode": str(linked.get("comparison_mode", "") or summary.get("comparison_mode", "") or ""),
+        "backtest_source_type": str(linked.get("backtest_source_type", "") or summary.get("backtest_source_type", "") or ""),
+        "mismatch_count": int(summary.get("mismatch_count", 0) or 0),
+        "live_trade_count": int(summary.get("live_trade_count", 0) or 0),
+        "replay_trade_count": int(summary.get("replay_trade_count", 0) or 0),
+        "root_cause_tags": [str(x or "").strip() for x in (linked.get("root_cause_tags") or summary.get("root_cause_tags") or []) if str(x or "").strip()],
+        "first_divergence_stage": str(first_divergence.get("stage", "") or summary.get("first_divergence_stage", "") or ""),
+        "first_divergence_reason": str(first_divergence.get("reason_code", "") or summary.get("first_divergence_reason", "") or ""),
+        "top_root_cause": str(top_candidate.get("candidate", "") or ""),
+        "top_root_cause_confidence": top_candidate.get("confidence"),
+        "note": str(linked.get("note", "") or summary.get("note", "") or ""),
+        "linked_report_id": str(linked.get("linked_report_id", "") or summary.get("linked_report_id", "") or ""),
+    }
+    return out
+
+
+def _build_replay_backtest_result(current_report: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "report_id": current_report.get("report_id"),
+        "status": current_report.get("status"),
+        "error_msg": current_report.get("error_msg"),
+        "summary": current_report.get("summary"),
+        "ranking": current_report.get("ranking"),
+        "strategy_reports": current_report.get("strategy_reports"),
+        "request": current_report.get("request"),
+    }
+
+
+def _validate_compare_strategy_scope(requested_strategy_ids, available_strategy_ids) -> str:
+    requested = _normalize_text_list(requested_strategy_ids)
+    if not requested:
+        return ""
+    available = set(_normalize_text_list(available_strategy_ids))
+    if not available:
+        return "所选实盘样本中没有可用于对比的策略"
+    missing = [sid for sid in requested if sid not in available]
+    if missing:
+        return f"以下策略不在当前样本范围内：{'、'.join(missing)}"
+    return ""
+
+
+def _rebuild_strategy_score_cache():
+    global strategy_score_cache
+    stats = {}
+    for rep in report_history if isinstance(report_history, list) else []:
+        if not isinstance(rep, dict):
+            continue
+        summary = rep.get("summary") if isinstance(rep.get("summary"), dict) else {}
+        ranking = summary.get("ranking", []) if isinstance(summary, dict) else []
+        if not isinstance(ranking, list):
+            continue
+        for row in ranking:
+            if not isinstance(row, dict):
+                continue
+            sid = str(row.get("strategy_id", "")).strip()
+            if not sid:
+                continue
+            score = row.get("score_total", None)
+            if not isinstance(score, numbers.Number):
+                continue
+            score = float(score)
+            annual = float(row.get("annualized_roi", 0.0) or 0.0)
+            dd = float(row.get("max_dd", 0.0) or 0.0)
+            tr = float(row.get("total_trades", 0.0) or 0.0)
+            x = stats.get(sid)
+            if x is None:
+                stats[sid] = {
+                    "count": 1,
+                    "score_sum": score,
+                    "annual_sum": annual,
+                    "dd_sum": dd,
+                    "trades_sum": tr,
+                    "score_total_latest": score,
+                    "rating_latest": str(row.get("rating", "")).strip() or _score_grade(score)
+                }
+            else:
+                x["count"] += 1
+                x["score_sum"] += score
+                x["annual_sum"] += annual
+                x["dd_sum"] += dd
+                x["trades_sum"] += tr
+    out = {}
+    for sid, x in stats.items():
+        cnt = max(1, int(x.get("count", 1)))
+        avg_score = float(x.get("score_sum", 0.0)) / cnt
+        penalty = _sample_size_penalty_points(cnt)
+        confidence = _sample_size_confidence(cnt)
+        adjusted = max(0.0, avg_score - penalty)
+        out[sid] = {
+            "score_total": avg_score,
+            "rating": _score_grade(adjusted),
+            "score_total_adjusted": adjusted,
+            "score_penalty_points": penalty,
+            "score_confidence": confidence,
+            "score_backtest_count": cnt,
+            "score_total_latest": float(x.get("score_total_latest", 0.0)),
+            "rating_latest": str(x.get("rating_latest", "C")),
+            "score_annualized_roi_avg": float(x.get("annual_sum", 0.0)) / cnt,
+            "score_max_dd_avg": float(x.get("dd_sum", 0.0)) / cnt,
+            "score_trades_avg": float(x.get("trades_sum", 0.0)) / cnt
+        }
+    strategy_score_cache = out
+
+def _safe_json_obj(obj):
+    try:
+        return json.loads(json.dumps(obj, ensure_ascii=False, default=str))
+    except Exception:
+        return None
+
+def _sanitize_non_finite(obj):
+    if isinstance(obj, dict):
+        return {k: _sanitize_non_finite(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_non_finite(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [_sanitize_non_finite(v) for v in obj]
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, numbers.Integral):
+        return int(obj)
+    if isinstance(obj, numbers.Real):
+        v = float(obj)
+        return v if math.isfinite(v) else 0.0
+    return obj
+
+
+def _resolve_event_stock_code(event_type, emit_data, stock_code):
+    if str(stock_code or "").strip():
+        return str(stock_code).strip().upper()
+    if isinstance(emit_data, dict):
+        if str(emit_data.get("stock_code", "")).strip():
+            return str(emit_data.get("stock_code", "")).strip().upper()
+        if str(emit_data.get("stock", "")).strip():
+            return str(emit_data.get("stock", "")).strip().upper()
+    if str(event_type or "").startswith("backtest_") and isinstance(current_backtest_report, dict):
+        if str(current_backtest_report.get("stock_code", "")).strip():
+            return str(current_backtest_report.get("stock_code", "")).strip().upper()
+    return ""
+
+
+async def _try_attach_fundamental_profile(event_type, emit_data, stock_code):
+    if not isinstance(emit_data, dict):
+        return emit_data
+    code = _resolve_event_stock_code(event_type, emit_data, stock_code)
+    if not code:
+        return emit_data
+    et = str(event_type or "").strip().lower()
+    context = "backtest" if et.startswith("backtest_") else "live"
+    allow_network = et in {"backtest_result", "live_alert", "daily_summary"}
+    try:
+        profile = await asyncio.to_thread(
+            fundamental_adapter_manager.get_profile,
+            code,
+            context,
+            False,
+            allow_network
+        )
+    except Exception as e:
+        profile = {"status": "error", "msg": f"fundamental adapter error: {e}"}
+    if isinstance(profile, dict):
+        out = dict(emit_data)
+        out["fundamental_profile"] = profile
+        return out
+    return emit_data
+
+
+async def _maybe_prefetch_fundamental_before_backtest(stock_code: str, emit_to_frontend: bool = True):
+    try:
+        if not fundamental_adapter_manager.prefetch_on_backtest_start():
+            return
+        code = str(stock_code or "").strip().upper()
+        if not code:
+            return
+
+        # 预热前明确告知用户基本面适配器的提供方与潜在动作
+        profile = await asyncio.to_thread(fundamental_adapter_manager.get_profile, code, "backtest", False, True)
+        fa_provider = str((profile or {}).get("provider", "") or "").strip().lower()
+        fa_display = {"tdx": "TDX(通达信)", "tushare": "Tushare"}.get(fa_provider, fa_provider.upper() if fa_provider else "")
+        if fa_display:
+            hint = f"正在用 {fa_display} 预热基本面数据，mootdx 探测最快服务器属正常行为，请稍候..."
+        else:
+            hint = "正在预热基本面数据，请稍候..."
+        if emit_to_frontend:
+            await manager.broadcast({"type": "system", "data": {"msg": hint}})
+        logger.info(hint)
+
+        status = str((profile or {}).get("status", "")).strip().lower() if isinstance(profile, dict) else ""
+        if emit_to_frontend:
+            if status in {"success", "empty"}:
+                await manager.broadcast({"type": "system", "data": {"msg": f"基本面预热完成：{code}（status={status}）"}})
+            elif status in {"disabled", "throttled"}:
+                await manager.broadcast({"type": "system", "data": {"msg": f"基本面预热跳过：{code}（{status}）"}})
+            elif status:
+                msg = str(profile.get("msg", "") or "")
+                await manager.broadcast({"type": "system", "data": {"msg": f"基本面预热异常：{code}（{status}{' - ' + msg if msg else ''}）"}})
+    except Exception as e:
+        logger.warning("fundamental prefetch before backtest failed stock=%s err=%s", stock_code, e, exc_info=True)
+        if emit_to_frontend:
+            await manager.broadcast({"type": "system", "data": {"msg": f"基本面预热异常：{stock_code} - {e}"}})
+
+def start_new_backtest_report(stock_code, strategy_id, request_payload=None):
+    global current_backtest_report, latest_backtest_result, latest_strategy_reports, current_backtest_progress, current_backtest_trades, backtest_kline_payload_cache
+    report_id = f"{int(datetime.now().timestamp() * 1000)}-{os.urandom(2).hex()}"
+    current_backtest_report = {
+        "report_id": report_id,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "stock_code": stock_code,
+        "strategy_id": strategy_id,
+        "status": "running",
+        "error_msg": None,
+        "request": request_payload if isinstance(request_payload, dict) else {},
+        "summary": None,
+        "ranking": [],
+        "strategy_reports": {}
+    }
+    latest_backtest_result = None
+    latest_strategy_reports = {}
+    current_backtest_progress = {"progress": 0, "current_date": None}
+    current_backtest_trades = []
+    backtest_kline_payload_cache = {}
+    return report_id
+
+def finalize_current_backtest_report():
+    global report_history, current_backtest_report
+    if not current_backtest_report:
+        return
+    if not current_backtest_report.get("finished_at"):
+        current_backtest_report["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    report_history = [r for r in report_history if r.get("report_id") != current_backtest_report.get("report_id")]
+    report_history.insert(0, current_backtest_report)
+    persist_report_history()
+    _rebuild_strategy_score_cache()
+
+def fail_current_backtest_report(msg):
+    global current_backtest_report
+    if not current_backtest_report:
+        return
+    current_backtest_report["status"] = "failed"
+    current_backtest_report["error_msg"] = str(msg)
+    current_backtest_report["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    finalize_current_backtest_report()
+
+def cancel_current_backtest_report(msg="backtest cancelled"):
+    global current_backtest_report
+    if not current_backtest_report:
+        return
+    current_backtest_report["status"] = "cancelled"
+    current_backtest_report["error_msg"] = str(msg)
+    current_backtest_report["finished_at"] = datetime.now().isoformat(timespec="seconds")
+    finalize_current_backtest_report()
+
+def _current_backtest_report_id() -> str:
+    if not isinstance(current_backtest_report, dict):
+        return ""
+    return str(current_backtest_report.get("report_id", "") or "").strip()
+
+def _is_active_backtest_report(report_id: str) -> bool:
+    rid = str(report_id or "").strip()
+    if not rid:
+        return False
+    return _current_backtest_report_id() == rid
+
+def _on_backtest_task_done(task: asyncio.Task):
+    global cabinet_task
+    try:
+        if cabinet_task is task:
+            cabinet_task = None
+    except Exception:
+        pass
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
+def _spawn_backtest_task(*args, **kwargs) -> asyncio.Task:
+    global cabinet_task
+    task = asyncio.create_task(run_backtest_task(*args, **kwargs))
+    task.add_done_callback(_on_backtest_task_done)
+    cabinet_task = task
+    return task
+
+# --- WebSocket Manager ---
+async def connect(websocket: WebSocket):
+    await websocket.accept()
+    active_connections.append(websocket)
+
+def disconnect(websocket: WebSocket):
+    active_connections.remove(websocket)
+
+async def broadcast(message: dict):
+    # print(f"Broadcasting: {message}")
+    for connection in active_connections:
+        try:
+            await connection.send_json(message)
+        except Exception:
+            pass
+
+# --- Event Callback for LiveCabinet ---
+async def cabinet_event_handler(event_type, data):
+    """
+    Bridge between LiveCabinet and WebSocket clients.
+    """
+    payload = {
+        "type": event_type,
+        "data": data,
+        "timestamp": asyncio.get_event_loop().time(),
+        "server_time": datetime.now().isoformat(timespec="seconds")
+    }
+    await broadcast(payload)
+
+# --- Models for API ---
+class BacktestRequest(BaseModel):
+    stock_code: str = "600036.SH"
+    strategy_id: str = "all"
+    strategy_ids: Optional[list[str]] = None
+    strategy_mode: Optional[str] = None
+    combination_config: Optional[dict] = None
+    start: Optional[str] = None
+    end: Optional[str] = None
+    capital: Optional[float] = None
+    realtime_push: Optional[bool] = True
+
+class ConsistencyReplayRequest(BaseModel):
+    market: str = "ashare"
+    code: str
+    start_date: str
+    end_date: str
+    capital: Optional[float] = None
+    realtime_push: Optional[bool] = False
+
+class ConsistencyNewBacktestRequest(BaseModel):
+    strategy_ids: Optional[list[str]] = None
+    capital: Optional[float] = None
+    strategy_mode: Optional[str] = None
+    combination_config: Optional[dict] = None
+    realtime_push: Optional[bool] = False
+
+class ConsistencyCompareRequest(BaseModel):
+    market: str = "ashare"
+    code: str
+    start_date: str
+    end_date: str
+    strategy_ids: Optional[list[str]] = None
+    timeframes: Optional[list[str]] = None
+    snapshot_selection_mode: str = "auto"
+    selected_snapshot_ids: Optional[list[str]] = None
+    backtest_source_type: str
+    selected_report_id: Optional[str] = None
+    new_backtest_request: Optional[ConsistencyNewBacktestRequest] = None
+    note: Optional[str] = None
+
+class LiveRequest(BaseModel):
+    stock_code: Optional[str] = None
+    stock_codes: Optional[list[str]] = None
+    strategy_id: Optional[str] = None
+    strategy_ids: Optional[list[str]] = None
+    stock_strategy_map: Optional[dict[str, list[str]]] = None
+    total_capital: Optional[float] = None
+    allocation_mode: Optional[str] = None
+    allocation_weights: Optional[dict[str, float]] = None
+    replace_existing: bool = True
+
+class StrategySwitchRequest(BaseModel):
+    strategy_id: Optional[str] = None
+    strategy_ids: Optional[list[str]] = None
+    stock_codes: Optional[list[str]] = None
+    stock_strategy_map: Optional[dict[str, list[str]]] = None
+
+class SourceSwitchRequest(BaseModel):
+    source: str
+
+class LiveFundPoolResetRequest(BaseModel):
+    stock_code: str
+    initial_capital: Optional[float] = None
+
+class WebhookRetryRequest(BaseModel):
+    event_ids: Optional[list[str]] = None
+    limit: int = 20
+
+class WebhookDeleteRequest(BaseModel):
+    event_ids: Optional[list[str]] = None
+
+class WebhookDailySummaryRepushRequest(BaseModel):
+    date: Optional[str] = None
+
+class ConfigUpdateRequest(BaseModel):
+    config: dict
+
+class TushareConnectivityTestRequest(BaseModel):
+    api_url: Optional[str] = None
+    token: Optional[str] = None
+    stock_code: Optional[str] = None
+
+class TdxConnectivityTestRequest(BaseModel):
+    tdxdir: Optional[str] = None
+    stock_code: Optional[str] = None
+    auto_detect: bool = True
+
+class StrategyToggleRequest(BaseModel):
+    strategy_id: str
+    enabled: bool
+
+class StrategyAnalyzeRequest(BaseModel):
+    template_text: str
+    strategy_name: Optional[str] = None
+    code_template: Optional[str] = None
+    kline_type: Optional[str] = None
+
+
+class StrategyMarketAnalyzeRequest(BaseModel):
+    market_state: dict
+    strategy_name: Optional[str] = None
+    code_template: Optional[str] = None
+    kline_type: Optional[str] = None
+
+class StrategyAddRequest(BaseModel):
+    strategy_id: str
+    strategy_name: str
+    class_name: Optional[str] = None
+    code: str
+    template_text: Optional[str] = None
+    analysis_text: Optional[str] = None
+    strategy_intent: Optional[dict] = None
+    source: Optional[str] = None
+    kline_type: Optional[str] = None
+    raw_requirement_title: Optional[str] = None
+    raw_requirement: Optional[str] = None
+    depends_on: Optional[list[str]] = None
+    protect_level: Optional[str] = None
+    immutable: Optional[bool] = None
+
+
+class StrategyUpdateRequest(BaseModel):
+    strategy_id: str
+    strategy_name: Optional[str] = None
+    class_name: Optional[str] = None
+    code: Optional[str] = None
+    analysis_text: Optional[str] = None
+    source: Optional[str] = None
+    kline_type: Optional[str] = None
+    raw_requirement_title: Optional[str] = None
+    raw_requirement: Optional[str] = None
+    depends_on: Optional[list[str]] = None
+    protect_level: Optional[str] = None
+    immutable: Optional[bool] = None
+
+class StrategyDeleteRequest(BaseModel):
+    strategy_id: str
+    force: bool = False
+
+class ReportDeleteRequest(BaseModel):
+    report_id: str
+
+
+class EvolutionRunUpsertRequest(BaseModel):
+    run_id: str
+    status: Optional[str] = None
+    score: Optional[float] = None
+    child_gene_id: Optional[str] = None
+    child_gene_parent_ids: Optional[List[str]] = None
+    child_gene_fingerprint: Optional[str] = None
+    child_gene_family: Optional[str] = None
+    parent_strategy_id: Optional[str] = None
+    parent_strategy_name: Optional[str] = None
+    strategy_id: Optional[str] = None
+    strategy_name: Optional[str] = None
+    committed_strategy_id: Optional[str] = None
+    committed_strategy_name: Optional[str] = None
+    committed_version: Optional[int] = None
+    strategy_code_sha256: Optional[str] = None
+    metrics: Optional[Dict[str, Any]] = None
+    profile: Optional[Dict[str, Any]] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    note: Optional[str] = None
+
+
+class EvolutionFamilyUpsertRequest(BaseModel):
+    family: str
+    run_count: Optional[int] = 0
+    avg_score: Optional[float] = 0.0
+    avg_sharpe: Optional[float] = 0.0
+    avg_drawdown: Optional[float] = 0.0
+    note: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class FundamentalProfileRequest(BaseModel):
+    stock_code: str
+    context: Optional[str] = "backtest"
+    force: Optional[bool] = False
+    allow_network: Optional[bool] = True
+
+
+class HistorySyncRunRequest(BaseModel):
+    codes: Optional[list[str]] = None
+    tables: Optional[list[str]] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    time_mode: Optional[str] = None
+    custom_start_time: Optional[str] = None
+    custom_end_time: Optional[str] = None
+    session_only: Optional[bool] = None
+    intraday_mode: Optional[bool] = None
+    lookback_days: int = 10
+    max_codes: int = 10000
+    batch_size: int = 500
+    dry_run: bool = False
+    on_duplicate: str = "ignore"
+    write_mode: Optional[str] = None
+    direct_db_source: Optional[str] = None
+    async_run: bool = False
+
+class HistorySyncScheduleRequest(BaseModel):
+    interval_minutes: int = 60
+    lookback_days: int = 10
+    time_mode: Optional[str] = None
+    custom_start_time: Optional[str] = None
+    custom_end_time: Optional[str] = None
+    session_only: Optional[bool] = None
+    intraday_mode: Optional[bool] = None
+    max_codes: int = 10000
+    batch_size: int = 500
+    tables: Optional[list[str]] = None
+    dry_run: bool = False
+    on_duplicate: str = "ignore"
+    write_mode: Optional[str] = None
+    direct_db_source: Optional[str] = None
+
+class FrontendAssetCacheRequest(BaseModel):
+    relative_path: str
+    remote_url: str
+
+
+class TdxCompileRequest(BaseModel):
+    formula_text: str
+    strategy_id: Optional[str] = None
+    strategy_name: Optional[str] = None
+    kline_type: Optional[str] = None
+
+
+class TdxValidateRequest(BaseModel):
+    formula_text: str
+    strategy_id: Optional[str] = None
+    strategy_name: Optional[str] = None
+    kline_type: Optional[str] = None
+    strict: bool = True
+    include_code: bool = False
+
+
+class TdxImportRequest(BaseModel):
+    formula_text: str
+    strategy_id: Optional[str] = None
+    strategy_name: Optional[str] = None
+    kline_type: Optional[str] = None
+    analysis_text: Optional[str] = None
+    source: Optional[str] = None
+    protect_level: Optional[str] = None
+    immutable: Optional[bool] = None
+
+
+class TdxImportPackItem(BaseModel):
+    formula_text: str
+    strategy_id: Optional[str] = None
+    strategy_name: Optional[str] = None
+    kline_type: Optional[str] = None
+    analysis_text: Optional[str] = None
+    source: Optional[str] = None
+    protect_level: Optional[str] = None
+    immutable: Optional[bool] = None
+
+
+class TdxImportPackRequest(BaseModel):
+    items: list[TdxImportPackItem]
+    stop_on_error: bool = False
+    skip_existing: bool = True
+
+
+class TdxGenerateFormulaRequest(BaseModel):
+    prompt: str
+    kline_type: Optional[str] = None
+
+
+class TdxTerminalConnectRequest(BaseModel):
+    adapter: Optional[str] = "mock"
+    host: Optional[str] = "127.0.0.1"
+    port: Optional[int] = 7708
+    account_id: Optional[str] = ""
+    api_key: Optional[str] = ""
+    api_secret: Optional[str] = ""
+    sign_method: Optional[str] = "none"
+    base_url: Optional[str] = ""
+    timeout_sec: Optional[int] = 10
+    retry_count: Optional[int] = 0
+    hook_enabled: Optional[bool] = True
+    hook_level: Optional[str] = "INFO"
+    hook_logger_name: Optional[str] = "TdxBrokerGatewayHook"
+    hook_log_payload: Optional[bool] = True
+
+
+class TdxTerminalSubscribeRequest(BaseModel):
+    symbols: List[str]
+
+
+class TdxTerminalOrderRequest(BaseModel):
+    symbol: str
+    direction: str
+    qty: int
+    price: Optional[float] = 0.0
+
+
+class TdxTerminalBrokerLoginRequest(BaseModel):
+    username: str
+    password: str
+    initial_cash: Optional[float] = 1000000.0
+
+
+class TdxTerminalBrokerCancelRequest(BaseModel):
+    order_id: str
+
+
+class BlkParseRequest(BaseModel):
+    file_path: Optional[str] = None
+    content: Optional[str] = None
+    encoding: Optional[str] = "auto"
+    normalize_symbol: bool = True
+
+
+class BlkImportStockPoolRequest(BaseModel):
+    file_path: Optional[str] = None
+    content: Optional[str] = None
+    encoding: Optional[str] = "auto"
+    normalize_symbol: bool = True
+    import_mode: Optional[str] = "append"  # append | replace
+    market_tag: Optional[str] = "主板"
+    industry_tag: Optional[str] = "BLK导入"
+    size_tag: Optional[str] = "未知"
+    enabled: Optional[bool] = True
+    stock_pool_csv: Optional[str] = "data/任务生成_标的池.csv"
+
+
+class BatchGenerateTasksRequest(BaseModel):
+    generate_mode: Optional[str] = "append"  # append | replace
+    generate_max_tasks: Optional[int] = 0
+    tasks_csv: Optional[str] = DEFAULT_BATCH_TASKS_CSV
+    generator_strategies_csv: Optional[str] = "data/任务生成_策略池.csv"
+    generator_stocks_csv: Optional[str] = "data/任务生成_标的池.csv"
+    generator_windows_csv: Optional[str] = "data/任务生成_区间池.csv"
+    generator_scenarios_csv: Optional[str] = "data/任务生成_场景池.csv"
+
+
+class BatchRunControlRequest(BaseModel):
+    tasks_csv: Optional[str] = DEFAULT_BATCH_TASKS_CSV
+    results_csv: Optional[str] = "data/批量回测结果.csv"
+    summary_csv: Optional[str] = "data/策略汇总评分.csv"
+    batch_no_filter: Optional[str] = ""
+    archive_completed: Optional[bool] = False
+    archive_tasks_csv: Optional[str] = DEFAULT_BATCH_ARCHIVE_CSV
+    max_tasks: Optional[int] = 0
+    parallel_workers: Optional[int] = 1
+    base_url: Optional[str] = "http://127.0.0.1:8000"
+    base_urls: Optional[str] = ""
+    rate_limit_interval_seconds: Optional[float] = 0.0
+    poll_seconds: Optional[int] = 3
+    status_log_seconds: Optional[int] = 90
+    max_wait_seconds: Optional[int] = 7200
+    retry_sleep_seconds: Optional[int] = 3
+    ai_analyze: Optional[bool] = False
+    ai_analyze_only: Optional[bool] = False
+    ai_analysis_output_md: Optional[str] = "data/批量回测AI分析.md"
+    ai_analysis_system_prompt: Optional[str] = ""
+    ai_analysis_prompt: Optional[str] = ""
+    ai_analysis_max_results: Optional[int] = 200
+    ai_analysis_max_strategies: Optional[int] = 80
+    ai_analysis_temperature: Optional[float] = -1.0
+    ai_analysis_max_tokens: Optional[int] = 1400
+    ai_analysis_timeout_sec: Optional[int] = 60
+
+
+class BatchStrategyPoolSyncRequest(BaseModel):
+    strategy_pool_csv: Optional[str] = "data/任务生成_策略池.csv"
+    strategy_ids: Optional[List[str]] = None
+    use_all_enabled: Optional[bool] = False
+    mode: Optional[str] = "replace"  # replace | append
+
+
+class BatchTaskCsvCreateRequest(BaseModel):
+    prefix: Optional[str] = ""
+    file_name: Optional[str] = ""
+    overwrite: Optional[bool] = False
+
+
+class BatchCombinationRecommendRequest(BaseModel):
+    strategy_ids: Optional[List[str]] = None
+    strategy_profiles: Optional[List[Dict[str, Any]]] = None
+    max_tokens: Optional[int] = 600
+    temperature: Optional[float] = 0.2
+
+
+class EvolutionStartRequest(BaseModel):
+    interval_seconds: Optional[float] = 1.0
+    max_iterations: Optional[int] = None
+    seed_strategy_id: Optional[str] = None
+    seed_strategy_ids: Optional[List[str]] = None
+    seed_include_builtin: Optional[bool] = None
+    seed_only_enabled: Optional[bool] = None
+    target_stock_codes: Optional[List[str]] = None
+    timeframes: Optional[List[str]] = None
+    persist_enabled: Optional[bool] = None
+    persist_score_threshold: Optional[float] = None
+    family_alert_preset: Optional[str] = None
+    family_adaptive_blend_ratio: Optional[float] = None
+
+
+class EvolutionProfileUpdateRequest(BaseModel):
+    seed_strategy_id: Optional[str] = None
+    seed_strategy_ids: Optional[List[str]] = None
+    seed_include_builtin: Optional[bool] = None
+    seed_only_enabled: Optional[bool] = None
+    target_stock_codes: Optional[List[str]] = None
+    timeframes: Optional[List[str]] = None
+    persist_enabled: Optional[bool] = None
+    persist_score_threshold: Optional[float] = None
+    family_alert_preset: Optional[str] = None
+    family_adaptive_blend_ratio: Optional[float] = None
+    updated_by: Optional[str] = None
+    source: Optional[str] = None
+
+
+
+def _extract_code_block(text):
+    m = re.search(r"```python\s*([\s\S]*?)```", str(text or ""), re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(r"```\s*([\s\S]*?)```", str(text or ""), re.IGNORECASE)
+    return m2.group(1).strip() if m2 else str(text or "").strip()
+
+
+def _extract_first_class_name(code_text):
+    m = re.search(r"class\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", str(code_text or ""))
+    return m.group(1) if m else ""
+
+
+def _normalize_kline_type(value):
+    v = str(value or "").strip()
+    if not v:
+        return "1min"
+    return v
+
+
+def _extract_tdx_formula_text(content):
+    text = str(content or "").strip()
+    if not text:
+        return ""
+    patterns = [
+        r"```tdx\s*([\s\S]*?)```",
+        r"```txt\s*([\s\S]*?)```",
+        r"```text\s*([\s\S]*?)```",
+        r"```\s*([\s\S]*?)```",
+    ]
+    for p in patterns:
+        m = re.search(p, text, flags=re.IGNORECASE)
+        if m:
+            text = str(m.group(1) or "").strip()
+            break
+    lines = [str(x).strip() for x in text.replace("\r\n", "\n").split("\n")]
+    lines = [x for x in lines if x and not x.startswith("#")]
+    return "\n".join(lines).strip()
+
+
+def _build_tdx_formula_by_llm(prompt_text, kline_type):
+    requirement = str(prompt_text or "").strip()
+    tf = _normalize_kline_type(kline_type)
+    fallback_formula = "MA5:=MA(C,5);\nMA10:=MA(C,10);\nCROSS(MA5,MA10)"
+    cfg = ConfigLoader.reload()
+    api_key = str(
+        cfg.get("data_provider.strategy_llm_api_key", "")
+        or cfg.get("data_provider.llm_api_key", "")
+        or cfg.get("data_provider.api_key", "")
+        or cfg.get("data_provider.default_api_key", "")
+        or ""
+    ).strip()
+    base_url = str(
+        cfg.get("data_provider.strategy_llm_api_url", "")
+        or cfg.get("data_provider.llm_api_url", "")
+        or cfg.get("data_provider.default_api_url", "")
+        or ""
+    ).strip()
+    model_name = str(
+        cfg.get("data_provider.strategy_llm_model", "")
+        or cfg.get("data_provider.llm_model", "")
+        or ""
+    ).strip() or "gpt-4o-mini"
+    timeout_sec = int(
+        cfg.get("data_provider.strategy_llm_timeout_sec", 0)
+        or cfg.get("data_provider.llm_timeout_sec", 0)
+        or 120
+    )
+    timeout_sec = max(30, min(timeout_sec, 300))
+    if not api_key or not base_url:
+        return {
+            "formula_text": fallback_formula,
+            "kline_type": tf,
+            "model": "",
+            "msg": "未检测到可用大模型配置，已回退示例公式。"
+        }
+    url = base_url.rstrip("/")
+    if not url.endswith("/chat/completions"):
+        if url.endswith("/v1"):
+            url = f"{url}/chat/completions"
+        else:
+            url = f"{url}/v1/chat/completions"
+    system_prompt = (
+        "你是通达信公式专家。只输出通达信条件选股/交易公式，不要输出Python代码。"
+        "允许使用变量赋值与最终布尔表达式，输出必须可被编译器解析。"
+        "输出时不得包含解释、标题、序号。"
+    )
+    user_prompt = (
+        f"目标K线周期: {tf}\n"
+        f"需求描述: {requirement}\n\n"
+        "请输出通达信公式正文。"
+        "可使用函数: MA, EMA, HHV, LLV, REF, COUNT, IF, CROSS, ABS, MAX, MIN, STD。"
+        "最后一行必须是布尔信号表达式。"
+    )
+    payload = {
+        "model": model_name,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+    }
+    try:
+        req = urllib.request.Request(
+            url=url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8")
+        result = json.loads(raw)
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        formula_text = _extract_tdx_formula_text(content)
+        if not formula_text:
+            formula_text = fallback_formula
+        return {
+            "formula_text": formula_text,
+            "kline_type": tf,
+            "model": model_name,
+            "msg": "已生成公式。"
+        }
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="ignore")[:240]
+        except Exception:
+            detail = ""
+        msg = f"大模型生成失败（HTTP {int(e.code)}）"
+        if detail:
+            msg = f"{msg}：{detail}"
+        return {
+            "formula_text": fallback_formula,
+            "kline_type": tf,
+            "model": model_name,
+            "msg": f"{msg}，已回退示例公式。"
+        }
+    except Exception as e:
+        err = str(e).strip()
+        msg = f"大模型生成失败（{type(e).__name__}）"
+        if err:
+            msg = f"{msg}：{err[:200]}"
+        return {
+            "formula_text": fallback_formula,
+            "kline_type": tf,
+            "model": model_name,
+            "msg": f"{msg}，已回退示例公式。"
+        }
+
+
+def _apply_kline_type_to_code(code_text, kline_type):
+    code = str(code_text or "")
+    tf = _normalize_kline_type(kline_type)
+    pattern = r"trigger_timeframe\s*=\s*['\"][^'\"]+['\"]"
+    if re.search(pattern, code):
+        return re.sub(pattern, f'trigger_timeframe="{tf}"', code, count=1)
+    super_pattern = r"super\(\)\.__init__\((.*?)\)"
+    m = re.search(super_pattern, code, flags=re.DOTALL)
+    if not m:
+        return code
+    args_text = str(m.group(1) or "")
+    if "trigger_timeframe" in args_text:
+        return code
+    new_args = args_text.strip()
+    if new_args:
+        new_args = f"{new_args}, trigger_timeframe=\"{tf}\""
+    else:
+        new_args = f"trigger_timeframe=\"{tf}\""
+    return code[:m.start(1)] + new_args + code[m.end(1):]
+
+
+def _normalize_depends_on(values):
+    if not isinstance(values, list):
+        return []
+    out = []
+    seen = set()
+    for item in values:
+        sid = str(item or "").strip()
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        out.append(sid)
+    return out
+
+
+def _protected_strategy_ids():
+    raw = str(os.environ.get("STRATEGY_BASELINE_IDS", "34,34A4,34A5,34R1") or "").strip()
+    out = set()
+    for item in raw.split(","):
+        sid = str(item or "").strip()
+        if sid:
+            out.add(sid)
+    return out
+
+
+def _find_strategy_meta(strategy_id):
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        return None
+    for row in list_all_strategy_meta():
+        if str(row.get("id", "")).strip() == sid:
+            return row
+    return None
+
+
+def _is_protected_strategy(strategy_id):
+    sid = str(strategy_id or "").strip()
+    if not sid:
+        return False
+    if sid in _protected_strategy_ids():
+        return True
+    meta = _find_strategy_meta(sid)
+    if not isinstance(meta, dict):
+        return False
+    if bool(meta.get("immutable", False)):
+        return True
+    level = str(meta.get("protect_level", "")).strip().lower()
+    return level in {"baseline", "protected", "builtin"}
+
+
+def _build_ai_analysis(strategy_intent, strategy_id, strategy_name, code_template=None):
+    intent_obj = intent_engine.normalize(strategy_intent)
+    intent = intent_obj.to_dict()
+    intent_explain = intent_obj.explain()
+    cfg = ConfigLoader.reload()
+    api_key = str(
+        cfg.get("data_provider.strategy_llm_api_key", "")
+        or cfg.get("data_provider.llm_api_key", "")
+        or cfg.get("data_provider.api_key", "")
+        or cfg.get("data_provider.default_api_key", "")
+        or ""
+    ).strip()
+    base_url = str(
+        cfg.get("data_provider.strategy_llm_api_url", "")
+        or cfg.get("data_provider.llm_api_url", "")
+        or cfg.get("data_provider.default_api_url", "")
+        or ""
+    ).strip()
+    model_name = str(
+        cfg.get("data_provider.strategy_llm_model", "")
+        or cfg.get("data_provider.llm_model", "")
+        or ""
+    ).strip() or "gpt-4o-mini"
+    timeout_sec = int(
+        cfg.get("data_provider.strategy_llm_timeout_sec", 0)
+        or cfg.get("data_provider.llm_timeout_sec", 0)
+        or 120
+    )
+    timeout_sec = max(30, min(timeout_sec, 300))
+    strategy_name = str(strategy_name or f"AI策略{strategy_id}").strip()
+    fallback_code = build_fallback_strategy_code(strategy_id, strategy_name, intent_explain)
+    fallback_class_name = _extract_first_class_name(fallback_code)
+    if not api_key or not base_url:
+        return {
+            "analysis_text": "未检测到可用大模型配置，已返回可执行默认策略代码。",
+            "code": fallback_code,
+            "class_name": fallback_class_name,
+            "strategy_intent": intent,
+            "intent_explain": intent_explain
+        }
+    url = base_url.rstrip("/")
+    if not url.endswith("/chat/completions"):
+        if url.endswith("/v1"):
+            url = f"{url}/chat/completions"
+        else:
+            url = f"{url}/v1/chat/completions"
+    system_prompt = (
+        "你是资深量化开发专家。你只能根据StrategyIntent生成策略代码，禁止基于原始自然语言直接生成代码。"
+        "只生成一个类，继承BaseImplementedStrategy，类中必须实现on_bar。"
+        "必须遵守A股基础交易规则并在代码中显式实现："
+        "1) T+1：当日硅基不得当日流码，需记录last_buy_day并拦截所有SELL/止损/止盈路径；"
+        "2) 涨跌停：接近涨停禁止追高硅基；跌停或接近跌停不得流码，需pending_sell次日重试；"
+        "3) 停牌与异常数据：volume<=0或close<=0或high<low直接跳过；"
+        "4) 交易单位：硅基流码数量必须100股整数倍，不足100不下单；"
+        "5) 重复开仓限制：已有仓位不得重复硅基；"
+        "6) 时间窗：明确硅基窗口与流码窗口，窗口外不交易；"
+        "7) 风控优先级：强制止损/风险退出优先于普通信号；"
+        "8) 代码健壮性：指标输入必须数值化处理，避免None/字符串导致运行时异常。"
+    )
+    user_prompt = (
+        f"策略ID固定为: {strategy_id}\n"
+        f"策略名称固定为: {strategy_name}\n"
+        f"StrategyIntent(JSON)：\n{json.dumps(intent, ensure_ascii=False, indent=2)}\n\n"
+        f"Intent解释：{intent_explain}\n\n"
+        "基础约束补充：A股T+1、涨跌停限制、停牌与异常数据过滤、100股整手、已有仓位禁止重复硅基、"
+        "交易时间窗、强制风控优先、pending_sell重试机制，必须全部落地到代码。\n\n"
+        f"请尽量遵循以下代码骨架与风格约束：\n{str(code_template or '').strip()}\n\n"
+        "返回格式：先给Intent可解释性说明，再给```python```代码块。代码需可直接运行于当前项目。"
+    )
+    payload = {
+        "model": model_name,
+        "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+    }
+    try:
+        req = urllib.request.Request(
+            url=url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8")
+        result = json.loads(raw)
+        content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+        code = _extract_code_block(content)
+        class_name = _extract_first_class_name(code)
+        if not code or not class_name:
+            return {
+                "analysis_text": "大模型返回内容未包含可执行代码，已回退默认策略代码。",
+                "code": fallback_code,
+                "class_name": fallback_class_name,
+                "strategy_intent": intent,
+                "intent_explain": intent_explain
+            }
+        analysis_text = re.sub(r"```[\s\S]*?```", "", str(content or "")).strip()
+        if not analysis_text:
+            analysis_text = "已完成策略分析并生成可执行代码。"
+        return {
+            "analysis_text": analysis_text,
+            "code": code,
+            "class_name": class_name,
+            "strategy_intent": intent,
+            "intent_explain": intent_explain
+        }
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="ignore")[:240]
+        except Exception:
+            detail = ""
+        msg = f"大模型分析调用失败（HTTP {int(e.code)}）"
+        if detail:
+            msg = f"{msg}：{detail}"
+        return {
+            "analysis_text": f"{msg}，已回退默认策略代码。",
+            "code": fallback_code,
+            "class_name": fallback_class_name,
+            "strategy_intent": intent,
+            "intent_explain": intent_explain
+        }
+    except Exception as e:
+        err = str(e).strip()
+        msg = f"大模型分析调用失败（{type(e).__name__}）"
+        if err:
+            msg = f"{msg}：{err[:200]}"
+        return {
+            "analysis_text": f"{msg}，已回退默认策略代码。",
+            "code": fallback_code,
+            "class_name": fallback_class_name,
+            "strategy_intent": intent,
+            "intent_explain": intent_explain
+        }
+
+# --- Routes ---
+
+@app.get("/")
+async def get_dashboard():
+    html = open(_bundle_path("dashboard.html"), "r", encoding="utf-8").read()
+    live_enabled_flag = "true" if is_live_enabled() else "false"
+    html = html.replace(
+        "<!-- JavaScript Logic -->",
+        f"<script>window.__LIVE_ENABLED__ = {live_enabled_flag};</script>\n    <!-- JavaScript Logic -->",
+        1
+    )
+    return HTMLResponse(content=html)
+
+@app.get("/report")
+async def get_report_page():
+    return HTMLResponse(content=open(_bundle_path("backtest_report.html"), "r", encoding="utf-8").read())
+
+
+@app.get("/logo.png")
+async def get_logo():
+    logo_path = os.path.abspath(_bundle_path("logo.png"))
+    if not os.path.exists(logo_path):
+        raise HTTPException(status_code=404, detail="logo not found")
+    return FileResponse(
+        logo_path,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"}
+    )
+
+
+@app.get("/favicon.ico")
+async def get_favicon():
+    return await get_logo()
+
+
+def _cache_frontend_asset_file(remote_url: str, target_path: str):
+    os.makedirs(os.path.dirname(target_path), exist_ok=True)
+    tmp_path = f"{target_path}.tmp"
+    try:
+        with urllib.request.urlopen(remote_url, timeout=20) as resp:
+            body = resp.read()
+        if not body:
+            raise RuntimeError("downloaded file is empty")
+        with open(tmp_path, "wb") as f:
+            f.write(body)
+        os.replace(tmp_path, target_path)
+        return
+    except Exception as e:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        ps_url = remote_url.replace("'", "''")
+        ps_out = tmp_path.replace("'", "''")
+        ps_cmd = f"Invoke-WebRequest -Uri '{ps_url}' -OutFile '{ps_out}' -UseBasicParsing"
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or result.stdout or "").strip()
+            if stderr:
+                raise RuntimeError(f"{str(e)} | powershell: {stderr[:300]}")
+            raise
+        if not os.path.exists(tmp_path) or os.path.getsize(tmp_path) <= 0:
+            raise RuntimeError("powershell downloaded file is empty")
+        os.replace(tmp_path, target_path)
+
+def _cache_fontawesome_webfonts_if_needed(rel_path: str, remote_url: str, target_path: str):
+    normalized = rel_path.replace("\\", "/").lower()
+    if "font-awesome" not in normalized or not normalized.endswith("/css/all.min.css"):
+        return
+    base_remote = remote_url.rsplit("/css/all.min.css", 1)[0]
+    if not base_remote:
+        return
+    css_dir = os.path.dirname(target_path)
+    fa_root = os.path.dirname(css_dir)
+    webfont_dir = os.path.join(fa_root, "webfonts")
+    names = [
+        "fa-solid-900.woff2",
+        "fa-regular-400.woff2",
+        "fa-brands-400.woff2",
+        "fa-solid-900.ttf",
+        "fa-regular-400.ttf",
+        "fa-brands-400.ttf"
+    ]
+    for name in names:
+        fp = os.path.join(webfont_dir, name)
+        if os.path.exists(fp) and os.path.getsize(fp) > 0:
+            continue
+        url = f"{base_remote}/webfonts/{name}"
+        try:
+            _cache_frontend_asset_file(url, fp)
+        except Exception as e:
+            logger.warning("font-awesome webfont cache failed: %s %s", name, str(e))
+
+def _frontend_asset_candidate_urls(rel_path: str, remote_url: str):
+    out = []
+    seen = set()
+    def add(u):
+        uu = str(u or "").strip()
+        if not uu or uu in seen:
+            return
+        seen.add(uu)
+        out.append(uu)
+    normalized = str(rel_path or "").replace("\\", "/").lower()
+    add(remote_url)
+    if normalized.endswith("vendor/font-awesome/6.4.0/css/all.min.css"):
+        add("https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css")
+        add("https://fastly.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css")
+    if normalized.startswith("vendor/font-awesome/6.4.0/webfonts/"):
+        fname = normalized.split("/")[-1]
+        add(f"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/webfonts/{fname}")
+        add(f"https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/webfonts/{fname}")
+        add(f"https://fastly.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/webfonts/{fname}")
+    if normalized.endswith("vendor/lightweight-charts/lightweight-charts.standalone.production.js"):
+        add("https://cdn.jsdelivr.net/npm/lightweight-charts/dist/lightweight-charts.standalone.production.js")
+        add("https://fastly.jsdelivr.net/npm/lightweight-charts/dist/lightweight-charts.standalone.production.js")
+    return out
+
+def _cache_known_static_asset_if_missing(rel_path: str):
+    rel = str(rel_path or "").strip().replace("\\", "/")
+    if not rel or rel.startswith("/") or rel.startswith(".") or ".." in rel.split("/"):
+        return False
+    target_path = os.path.abspath(os.path.join(STATIC_DIR, rel))
+    try:
+        if os.path.commonpath([STATIC_DIR, target_path]) != STATIC_DIR:
+            return False
+    except Exception:
+        return False
+    if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+        return True
+    lowered = rel.lower()
+    primary = ""
+    if lowered == "vendor/font-awesome/6.4.0/css/all.min.css":
+        primary = "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css"
+    elif lowered.startswith("vendor/font-awesome/6.4.0/webfonts/"):
+        fname = lowered.split("/")[-1]
+        primary = f"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/webfonts/{fname}"
+    elif lowered == "vendor/lightweight-charts/lightweight-charts.standalone.production.js":
+        primary = "https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"
+    else:
+        return False
+    errs = []
+    for u in _frontend_asset_candidate_urls(rel, primary):
+        try:
+            _cache_frontend_asset_file(u, target_path)
+            _cache_fontawesome_webfonts_if_needed(rel, u, target_path)
+            return True
+        except Exception as e:
+            errs.append(str(e))
+    if errs:
+        logger.warning("static fallback cache failed: %s => %s", rel, errs[-1])
+    return False
+
+@app.post("/api/frontend/cache_asset")
+async def cache_frontend_asset(req: FrontendAssetCacheRequest):
+    rel_path = str(req.relative_path or "").strip().replace("\\", "/")
+    remote_url = str(req.remote_url or "").strip()
+    if not rel_path:
+        return {"status": "error", "msg": "relative_path is required"}
+    if rel_path.startswith("/") or rel_path.startswith(".") or ".." in rel_path.split("/"):
+        return {"status": "error", "msg": "invalid relative_path"}
+    if not remote_url.startswith("https://"):
+        return {"status": "error", "msg": "remote_url must be https"}
+    target_path = os.path.abspath(os.path.join(STATIC_DIR, rel_path))
+    try:
+        if os.path.commonpath([STATIC_DIR, target_path]) != STATIC_DIR:
+            return {"status": "error", "msg": "invalid target path"}
+    except Exception:
+        return {"status": "error", "msg": "invalid target path"}
+    local_url = f"/static/{rel_path}"
+    if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
+        return {"status": "success", "cached": True, "local_url": local_url}
+    errs = []
+    for u in _frontend_asset_candidate_urls(rel_path, remote_url):
+        try:
+            _cache_frontend_asset_file(u, target_path)
+            _cache_fontawesome_webfonts_if_needed(rel_path, u, target_path)
+            return {"status": "success", "cached": True, "local_url": local_url}
+        except Exception as e:
+            errs.append(str(e))
+    msg = " | ".join(errs[-2:]) if errs else "unknown"
+    return {"status": "error", "msg": f"cache failed: {msg}", "local_url": local_url}
+
+@app.get("/api/search")
+async def search_stocks(q: str = ""):
+    """Search stocks by code, name, or pinyin"""
+    return {"results": stock_manager.search(q)}
+
+@app.get("/api/strategies")
+async def api_strategies():
+    try:
+        strategies = strategy_factory_module.create_strategies()
+        return {
+            "status": "success",
+            "strategies": [{"id": s.id, "name": s.name} for s in strategies]
+        }
+    except Exception as e:
+        logger.error(f"Failed to load strategies: {e}", exc_info=True)
+        return {"status": "error", "strategies": []}
+
+
+@app.get("/api/strategy_manager/list")
+async def api_strategy_manager_list(page: Optional[int] = None, page_size: Optional[int] = None, all: Optional[bool] = None):
+    try:
+        rows = list_all_strategy_meta()
+        out = []
+        for row in rows:
+            sid = str(row.get("id", "")).strip()
+            item = dict(row)
+            sc = strategy_score_cache.get(sid, {})
+            item["score_total"] = sc.get("score_total", None)
+            item["rating"] = sc.get("rating", "")
+            item["score_total_adjusted"] = sc.get("score_total_adjusted", None)
+            item["score_penalty_points"] = sc.get("score_penalty_points", 0.0)
+            item["score_confidence"] = sc.get("score_confidence", 0.0)
+            item["score_backtest_count"] = sc.get("score_backtest_count", 0)
+            item["score_total_latest"] = sc.get("score_total_latest", None)
+            item["rating_latest"] = sc.get("rating_latest", "")
+            item["score_annualized_roi_avg"] = sc.get("score_annualized_roi_avg", 0.0)
+            item["score_max_dd_avg"] = sc.get("score_max_dd_avg", 0.0)
+            item["score_trades_avg"] = sc.get("score_trades_avg", 0.0)
+            out.append(item)
+        total = len(out)
+        force_all = bool(all)
+        if force_all:
+            return {
+                "status": "success",
+                "strategies": out,
+                "total": total,
+                "page": 1,
+                "page_size": total,
+                "has_next": False
+            }
+        if page is None or page_size is None:
+            return {
+                "status": "success",
+                "strategies": out,
+                "total": total,
+                "page": 1,
+                "page_size": total,
+                "has_next": False
+            }
+        p = max(1, int(page))
+        ps = max(1, min(int(page_size), 200))
+        start = (p - 1) * ps
+        end = start + ps
+        sliced = out[start:end]
+        has_next = end < total
+        return {
+            "status": "success",
+            "strategies": sliced,
+            "total": total,
+            "page": p,
+            "page_size": ps,
+            "has_next": has_next
+        }
+    except Exception as e:
+        logger.error(f"/api/strategy_manager/list failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e), "strategies": []}
+
+@app.get("/api/strategy_manager/detail")
+async def api_strategy_manager_detail(strategy_id: str):
+    try:
+        sid = str(strategy_id or "").strip()
+        if not sid:
+            return {"status": "error", "msg": "strategy_id is required"}
+        rows = list_all_strategy_meta()
+        target = None
+        for row in rows:
+            row_id = str(row.get("id", "")).strip()
+            if row_id == sid:
+                target = dict(row)
+                break
+        if target is None:
+            return {"status": "not_found", "msg": f"strategy {sid} not found"}
+        sc = strategy_score_cache.get(sid, {})
+        target["score_total"] = sc.get("score_total", None)
+        target["rating"] = sc.get("rating", "")
+        target["score_total_adjusted"] = sc.get("score_total_adjusted", None)
+        target["score_penalty_points"] = sc.get("score_penalty_points", 0.0)
+        target["score_confidence"] = sc.get("score_confidence", 0.0)
+        target["score_backtest_count"] = sc.get("score_backtest_count", 0)
+        target["score_total_latest"] = sc.get("score_total_latest", None)
+        target["rating_latest"] = sc.get("rating_latest", "")
+        target["score_annualized_roi_avg"] = sc.get("score_annualized_roi_avg", 0.0)
+        target["score_max_dd_avg"] = sc.get("score_max_dd_avg", 0.0)
+        target["score_trades_avg"] = sc.get("score_trades_avg", 0.0)
+        return {"status": "success", "strategy": target}
+    except Exception as e:
+        logger.error(f"/api/strategy_manager/detail failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e), "strategy": None}
+
+
+@app.post("/api/strategy_manager/toggle")
+async def api_strategy_manager_toggle(req: StrategyToggleRequest):
+    try:
+        if _is_protected_strategy(req.strategy_id) and (not req.enabled):
+            return {"status": "error", "msg": f"strategy {req.strategy_id} is protected and cannot be disabled"}
+        set_strategy_enabled(req.strategy_id, req.enabled)
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"/api/strategy_manager/toggle failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.post("/api/strategy_manager/analyze")
+async def api_strategy_manager_analyze(req: StrategyAnalyzeRequest):
+    strategy_id = next_custom_strategy_id()
+    strategy_name = str(req.strategy_name or f"AI策略{strategy_id}").strip()
+    intent = intent_engine.from_human_input(req.template_text)
+    result = _build_ai_analysis(intent.to_dict(), strategy_id, strategy_name, req.code_template)
+    kline_type = _normalize_kline_type(req.kline_type)
+    code_text = _apply_kline_type_to_code(result.get("code", ""), kline_type)
+    return {
+        "status": "success",
+        "source": "human",
+        "intent_stage": "中书省前置层",
+        "strategy_id": strategy_id,
+        "strategy_name": strategy_name,
+        "kline_type": kline_type,
+        "strategy_intent": result.get("strategy_intent", {}),
+        "intent_explain": result.get("intent_explain", ""),
+        "analysis_text": result.get("analysis_text", ""),
+        "code": code_text,
+        "class_name": result.get("class_name", ""),
+        "cabinet_flow": ["中书省前置层(Intent)", "中书省(策略生成)", "门下省(风控)", "尚书省(执行)"]
+    }
+
+
+@app.post("/api/strategy_manager/analyze_market")
+async def api_strategy_manager_analyze_market(req: StrategyMarketAnalyzeRequest):
+    strategy_id = next_custom_strategy_id()
+    strategy_name = str(req.strategy_name or f"市场驱动策略{strategy_id}").strip()
+    intent = intent_engine.from_market_analysis(req.market_state)
+    result = _build_ai_analysis(intent.to_dict(), strategy_id, strategy_name, req.code_template)
+    kline_type = _normalize_kline_type(req.kline_type)
+    code_text = _apply_kline_type_to_code(result.get("code", ""), kline_type)
+    return {
+        "status": "success",
+        "source": "market",
+        "intent_stage": "中书省前置层",
+        "strategy_id": strategy_id,
+        "strategy_name": strategy_name,
+        "kline_type": kline_type,
+        "strategy_intent": result.get("strategy_intent", {}),
+        "intent_explain": result.get("intent_explain", ""),
+        "analysis_text": result.get("analysis_text", ""),
+        "code": code_text,
+        "class_name": result.get("class_name", ""),
+        "cabinet_flow": ["中书省前置层(Intent)", "中书省(策略生成)", "门下省(风控)", "尚书省(执行)"]
+    }
+
+
+@app.get("/api/strategy_manager/next_id")
+async def api_strategy_manager_next_id():
+    try:
+        return {"status": "success", "strategy_id": next_custom_strategy_id()}
+    except Exception as e:
+        logger.error(f"/api/strategy_manager/next_id failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e), "strategy_id": ""}
+
+
+def _tdx_error(msg: str, error_code: str, details: Optional[dict] = None) -> Dict[str, Any]:
+    return {
+        "status": "error",
+        "msg": str(msg or ""),
+        "error_code": str(error_code or "TDX_UNKNOWN_ERROR"),
+        "details": details if isinstance(details, dict) else {},
+    }
+
+
+_TDX_TERMINAL_BRIDGE: Optional[TdxTerminalBridge] = None
+
+
+def _get_tdx_terminal_bridge() -> TdxTerminalBridge:
+    global _TDX_TERMINAL_BRIDGE
+    if _TDX_TERMINAL_BRIDGE is not None:
+        return _TDX_TERMINAL_BRIDGE
+    cfg = ConfigLoader.reload()
+    adapter = str(
+        cfg.get("tdx_terminal.adapter", "")
+        or os.environ.get("TDX_TERMINAL_ADAPTER", "")
+        or "mock"
+    ).strip().lower() or "mock"
+    _TDX_TERMINAL_BRIDGE = TdxTerminalBridge(adapter_type=adapter)
+    return _TDX_TERMINAL_BRIDGE
+
+
+@app.post("/api/tdx/generate_formula")
+async def api_tdx_generate_formula(req: TdxGenerateFormulaRequest):
+    try:
+        prompt_text = str(req.prompt or "").strip()
+        if not prompt_text:
+            return _tdx_error("prompt is required", "TDX_PROMPT_REQUIRED")
+        tf = _normalize_kline_type(req.kline_type)
+        payload = _build_tdx_formula_by_llm(prompt_text, tf)
+        return {
+            "status": "success",
+            "formula_text": str(payload.get("formula_text", "")).strip(),
+            "kline_type": tf,
+            "model": payload.get("model", ""),
+            "msg": payload.get("msg", "已生成公式。")
+        }
+    except Exception as e:
+        logger.error(f"/api/tdx/generate_formula failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_GENERATE_FAILED")
+
+
+@app.post("/api/tdx/compile")
+async def api_tdx_compile(req: TdxCompileRequest):
+    try:
+        formula_text = str(req.formula_text or "").strip()
+        if not formula_text:
+            return _tdx_error("formula_text is required", "TDX_FORMULA_REQUIRED")
+        sid = str(req.strategy_id or "").strip() or next_custom_strategy_id()
+        name = str(req.strategy_name or "").strip() or f"通达信策略{sid}"
+        tf = _normalize_kline_type(req.kline_type)
+        payload = compile_tdx_formula(
+            formula_text=formula_text,
+            strategy_id=sid,
+            strategy_name=name,
+            kline_type=tf,
+        )
+        return {
+            "status": "success",
+            "strategy_id": payload.get("strategy_id"),
+            "strategy_name": payload.get("strategy_name"),
+            "class_name": payload.get("class_name"),
+            "kline_type": tf,
+            "warmup_bars": payload.get("warmup_bars"),
+            "used_functions": payload.get("used_functions", []),
+            "compile_meta": payload.get("compile_meta", {}),
+            "code": payload.get("code", ""),
+        }
+    except Exception as e:
+        logger.error(f"/api/tdx/compile failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_COMPILE_FAILED")
+
+
+@app.post("/api/tdx/validate_formula")
+async def api_tdx_validate_formula(req: TdxValidateRequest):
+    try:
+        formula_text = str(req.formula_text or "").strip()
+        if not formula_text:
+            return _tdx_error("formula_text is required", "TDX_FORMULA_REQUIRED")
+        sid = str(req.strategy_id or "").strip() or "TDX_VALIDATE"
+        name = str(req.strategy_name or "").strip() or f"通达信策略{sid}"
+        tf = _normalize_kline_type(req.kline_type)
+        payload = compile_tdx_formula(
+            formula_text=formula_text,
+            strategy_id=sid,
+            strategy_name=name,
+            kline_type=tf,
+            strict=bool(req.strict),
+        )
+        resp = {
+            "status": "success",
+            "valid": True,
+            "strategy_id": payload.get("strategy_id"),
+            "strategy_name": payload.get("strategy_name"),
+            "class_name": payload.get("class_name"),
+            "kline_type": tf,
+            "warmup_bars": payload.get("warmup_bars"),
+            "used_functions": payload.get("used_functions", []),
+            "compile_meta": payload.get("compile_meta", {}),
+            "warnings": [],
+        }
+        if bool(req.include_code):
+            resp["code"] = payload.get("code", "")
+        return resp
+    except Exception as e:
+        logger.error(f"/api/tdx/validate_formula failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_VALIDATE_FAILED")
+
+
+def _import_single_tdx_formula(req_like: Any, skip_existing: bool = False) -> Dict[str, Any]:
+    formula_text = str(getattr(req_like, "formula_text", "") or "").strip()
+    if not formula_text:
+        raise ValueError("formula_text is required")
+    sid = str(getattr(req_like, "strategy_id", "") or "").strip() or next_custom_strategy_id()
+    if _find_strategy_meta(sid) is not None:
+        if bool(skip_existing):
+            return {
+                "status": "skipped",
+                "strategy_id": sid,
+                "msg": f"strategy id already exists: {sid}",
+            }
+        raise ValueError(f"strategy id already exists: {sid}")
+    sname = str(getattr(req_like, "strategy_name", "") or "").strip() or f"通达信策略{sid}"
+    tf = _normalize_kline_type(getattr(req_like, "kline_type", None))
+    payload = compile_tdx_formula(
+        formula_text=formula_text,
+        strategy_id=sid,
+        strategy_name=sname,
+        kline_type=tf,
+    )
+    code_text = _apply_kline_type_to_code(str(payload.get("code", "")), tf)
+    class_name = _extract_first_class_name(code_text) or str(payload.get("class_name", "")).strip()
+    analysis_text = str(getattr(req_like, "analysis_text", "") or "").strip() or "由通达信公式自动转换并导入。"
+    add_custom_strategy({
+        "id": sid,
+        "name": sname,
+        "class_name": class_name,
+        "code": code_text,
+        "template_text": formula_text,
+        "analysis_text": analysis_text,
+        "strategy_intent": intent_engine.from_human_input(f"通达信公式转换策略: {sname}").to_dict(),
+        "source": str(getattr(req_like, "source", "human") or "human").strip() or "human",
+        "kline_type": tf,
+        "depends_on": [],
+        "protect_level": str(getattr(req_like, "protect_level", "custom") or "custom").strip() or "custom",
+        "immutable": bool(getattr(req_like, "immutable", False)) if getattr(req_like, "immutable", None) is not None else False,
+        "raw_requirement_title": "通达信公式",
+        "raw_requirement": formula_text
+    })
+    return {
+        "status": "success",
+        "strategy_id": sid,
+        "strategy_name": sname,
+        "class_name": class_name,
+        "kline_type": tf,
+        "warmup_bars": payload.get("warmup_bars"),
+        "used_functions": payload.get("used_functions", []),
+        "compile_meta": payload.get("compile_meta", {}),
+    }
+
+
+@app.post("/api/tdx/import_strategy")
+async def api_tdx_import_strategy(req: TdxImportRequest):
+    try:
+        return _import_single_tdx_formula(req_like=req, skip_existing=False)
+    except Exception as e:
+        logger.error(f"/api/tdx/import_strategy failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_IMPORT_FAILED")
+
+
+@app.post("/api/tdx/import_pack")
+async def api_tdx_import_pack(req: TdxImportPackRequest):
+    try:
+        items = list(req.items or [])
+        if not items:
+            return _tdx_error("items is required", "TDX_ITEMS_REQUIRED")
+        imported: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+        failures: List[Dict[str, Any]] = []
+        for idx, item in enumerate(items):
+            try:
+                row = _import_single_tdx_formula(req_like=item, skip_existing=bool(req.skip_existing))
+                row = dict(row or {})
+                row["index"] = idx
+                if str(row.get("status", "")).strip() == "skipped":
+                    skipped.append(row)
+                else:
+                    imported.append(row)
+            except Exception as e:
+                failures.append({
+                    "index": idx,
+                    "strategy_id": str(getattr(item, "strategy_id", "") or "").strip(),
+                    "msg": str(e),
+                })
+                if bool(req.stop_on_error):
+                    break
+        if failures and (not imported) and (not skipped):
+            status = "error"
+        elif failures:
+            status = "partial_success"
+        else:
+            status = "success"
+        return {
+            "status": status,
+            "total": len(items),
+            "imported_count": len(imported),
+            "skipped_count": len(skipped),
+            "failed_count": len(failures),
+            "imported": imported,
+            "skipped": skipped,
+            "failures": failures,
+        }
+    except Exception as e:
+        logger.error(f"/api/tdx/import_pack failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_IMPORT_PACK_FAILED")
+
+
+@app.get("/api/tdx/capabilities")
+async def api_tdx_capabilities():
+    try:
+        return {
+            "status": "success",
+            "capabilities": get_tdx_compile_capabilities(),
+        }
+    except Exception as e:
+        logger.error(f"/api/tdx/capabilities failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_CAPABILITIES_FAILED")
+
+
+@app.get("/api/tdx/terminal/status")
+async def api_tdx_terminal_status():
+    try:
+        bridge = _get_tdx_terminal_bridge()
+        return {"status": "success", "terminal": bridge.status()}
+    except Exception as e:
+        logger.error(f"/api/tdx/terminal/status failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_TERMINAL_STATUS_FAILED")
+
+
+@app.post("/api/tdx/terminal/connect")
+async def api_tdx_terminal_connect(req: TdxTerminalConnectRequest):
+    try:
+        global _TDX_TERMINAL_BRIDGE
+        adapter = str(req.adapter or "").strip().lower() or "mock"
+        current = _get_tdx_terminal_bridge()
+        if str(current.adapter_type).lower() != adapter:
+            _TDX_TERMINAL_BRIDGE = TdxTerminalBridge(adapter_type=adapter)
+        bridge = _get_tdx_terminal_bridge()
+        payload = bridge.connect(
+            connection={
+                "host": str(req.host or "").strip(),
+                "port": int(req.port or 0),
+                "account_id": str(req.account_id or "").strip(),
+                "api_key": str(req.api_key or "").strip(),
+                "api_secret": str(req.api_secret or "").strip(),
+                "sign_method": str(req.sign_method or "none").strip().lower() or "none",
+                "base_url": str(req.base_url or "").strip(),
+                "timeout_sec": int(req.timeout_sec or 10),
+                "retry_count": int(req.retry_count or 0),
+                "hook_enabled": bool(req.hook_enabled) if req.hook_enabled is not None else True,
+                "hook_level": str(req.hook_level or "INFO").strip().upper() or "INFO",
+                "hook_logger_name": str(req.hook_logger_name or "TdxBrokerGatewayHook").strip() or "TdxBrokerGatewayHook",
+                "hook_log_payload": bool(req.hook_log_payload) if req.hook_log_payload is not None else True,
+            }
+        )
+        return {"status": "success", "terminal": payload}
+    except Exception as e:
+        logger.error(f"/api/tdx/terminal/connect failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_TERMINAL_CONNECT_FAILED")
+
+
+@app.post("/api/tdx/terminal/disconnect")
+async def api_tdx_terminal_disconnect():
+    try:
+        bridge = _get_tdx_terminal_bridge()
+        payload = bridge.disconnect()
+        return {"status": "success", "terminal": payload}
+    except Exception as e:
+        logger.error(f"/api/tdx/terminal/disconnect failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_TERMINAL_DISCONNECT_FAILED")
+
+
+@app.post("/api/tdx/terminal/subscribe")
+async def api_tdx_terminal_subscribe(req: TdxTerminalSubscribeRequest):
+    try:
+        symbols = [str(x or "").strip().upper() for x in (req.symbols or []) if str(x or "").strip()]
+        if not symbols:
+            return _tdx_error("symbols is required", "TDX_TERMINAL_SYMBOLS_REQUIRED")
+        bridge = _get_tdx_terminal_bridge()
+        payload = bridge.subscribe_quotes(symbols=symbols)
+        return {"status": "success", **payload}
+    except Exception as e:
+        logger.error(f"/api/tdx/terminal/subscribe failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_TERMINAL_SUBSCRIBE_FAILED")
+
+
+@app.get("/api/tdx/terminal/quotes")
+async def api_tdx_terminal_quotes():
+    try:
+        bridge = _get_tdx_terminal_bridge()
+        quotes = bridge.list_quotes()
+        return {"status": "success", "count": len(quotes), "quotes": quotes}
+    except Exception as e:
+        logger.error(f"/api/tdx/terminal/quotes failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_TERMINAL_QUOTES_FAILED")
+
+
+@app.post("/api/tdx/terminal/place_order")
+async def api_tdx_terminal_place_order(req: TdxTerminalOrderRequest):
+    try:
+        bridge = _get_tdx_terminal_bridge()
+        payload = bridge.place_order(
+            order={
+                "symbol": str(req.symbol or "").strip().upper(),
+                "direction": str(req.direction or "").strip().upper(),
+                "qty": int(req.qty or 0),
+                "price": float(req.price or 0.0),
+            }
+        )
+        return {"status": "success", "order": payload}
+    except Exception as e:
+        logger.error(f"/api/tdx/terminal/place_order failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_TERMINAL_ORDER_FAILED")
+
+
+@app.get("/api/tdx/terminal/orders")
+async def api_tdx_terminal_orders(limit: int = 50):
+    try:
+        bridge = _get_tdx_terminal_bridge()
+        rows = bridge.list_orders(limit=max(1, int(limit or 50)))
+        return {"status": "success", "count": len(rows), "orders": rows}
+    except Exception as e:
+        logger.error(f"/api/tdx/terminal/orders failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_TERMINAL_ORDERS_FAILED")
+
+
+@app.post("/api/tdx/terminal/broker/login")
+async def api_tdx_terminal_broker_login(req: TdxTerminalBrokerLoginRequest):
+    try:
+        username = str(req.username or "").strip()
+        password = str(req.password or "").strip()
+        if not username or not password:
+            return _tdx_error("username and password are required", "TDX_TERMINAL_BROKER_AUTH_REQUIRED")
+        bridge = _get_tdx_terminal_bridge()
+        payload = bridge.broker_login(
+            credentials={
+                "username": username,
+                "password": password,
+                "initial_cash": float(req.initial_cash or 1000000.0),
+            }
+        )
+        return {"status": "success", "login": payload}
+    except Exception as e:
+        logger.error(f"/api/tdx/terminal/broker/login failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_TERMINAL_BROKER_LOGIN_FAILED")
+
+
+@app.get("/api/tdx/terminal/broker/balance")
+async def api_tdx_terminal_broker_balance():
+    try:
+        bridge = _get_tdx_terminal_bridge()
+        payload = bridge.broker_get_balance()
+        return {"status": "success", "balance": payload}
+    except Exception as e:
+        logger.error(f"/api/tdx/terminal/broker/balance failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_TERMINAL_BROKER_BALANCE_FAILED")
+
+
+@app.get("/api/tdx/terminal/broker/positions")
+async def api_tdx_terminal_broker_positions():
+    try:
+        bridge = _get_tdx_terminal_bridge()
+        rows = bridge.broker_get_positions()
+        return {"status": "success", "count": len(rows), "positions": rows}
+    except Exception as e:
+        logger.error(f"/api/tdx/terminal/broker/positions failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_TERMINAL_BROKER_POSITIONS_FAILED")
+
+
+@app.post("/api/tdx/terminal/broker/cancel_order")
+async def api_tdx_terminal_broker_cancel_order(req: TdxTerminalBrokerCancelRequest):
+    try:
+        order_id = str(req.order_id or "").strip()
+        if not order_id:
+            return _tdx_error("order_id is required", "TDX_TERMINAL_ORDER_ID_REQUIRED")
+        bridge = _get_tdx_terminal_bridge()
+        payload = bridge.broker_cancel_order(order_id=order_id)
+        return {"status": "success", "cancel_result": payload}
+    except Exception as e:
+        logger.error(f"/api/tdx/terminal/broker/cancel_order failed: {e}", exc_info=True)
+        return _tdx_error(str(e), "TDX_TERMINAL_BROKER_CANCEL_FAILED")
+
+
+@app.post("/api/blk/parse")
+async def api_blk_parse(req: BlkParseRequest):
+    try:
+        file_path = str(req.file_path or "").strip()
+        content = str(req.content or "")
+        if not file_path and not content.strip():
+            return {"status": "error", "msg": "file_path or content is required"}
+        encoding = str(req.encoding or "auto").strip() or "auto"
+        if file_path:
+            payload = parse_blk_file(file_path=file_path, encoding=encoding)
+        else:
+            payload = parse_blk_text(content)
+            payload["path"] = ""
+        raw_codes = [str(x or "").strip() for x in payload.get("codes", []) if str(x or "").strip()]
+        if bool(req.normalize_symbol):
+            codes = [_normalize_symbol(x) for x in raw_codes]
+        else:
+            codes = raw_codes
+        unique_codes = []
+        seen = set()
+        for code in codes:
+            if code and code not in seen:
+                seen.add(code)
+                unique_codes.append(code)
+        return {
+            "status": "success",
+            "path": payload.get("path", ""),
+            "count": len(unique_codes),
+            "codes": unique_codes,
+            "invalid_lines": payload.get("invalid_lines", []),
+        }
+    except Exception as e:
+        logger.error(f"/api/blk/parse failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.post("/api/blk/import_stock_pool")
+async def api_blk_import_stock_pool(req: BlkImportStockPoolRequest):
+    try:
+        file_path = str(req.file_path or "").strip()
+        content = str(req.content or "")
+        if not file_path and not content.strip():
+            return {"status": "error", "msg": "file_path or content is required"}
+        encoding = str(req.encoding or "auto").strip() or "auto"
+        if file_path:
+            payload = parse_blk_file(file_path=file_path, encoding=encoding)
+        else:
+            payload = parse_blk_text(content)
+            payload["path"] = ""
+        raw_codes = [str(x or "").strip() for x in payload.get("codes", []) if str(x or "").strip()]
+        if bool(req.normalize_symbol):
+            codes = [_normalize_symbol(x) for x in raw_codes]
+        else:
+            codes = raw_codes
+        uniq_codes = []
+        seen_codes = set()
+        for code in codes:
+            c = str(code or "").strip().upper()
+            if not c or c in seen_codes:
+                continue
+            seen_codes.add(c)
+            uniq_codes.append(c)
+        pool_path = str(req.stock_pool_csv or "data/任务生成_标的池.csv").strip() or "data/任务生成_标的池.csv"
+        abs_path = os.path.abspath(pool_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        field_names = ["股票代码", "市场标签", "行业标签", "市值标签", "是否启用"]
+        rows = []
+        if os.path.exists(abs_path):
+            with open(abs_path, "r", encoding="utf-8-sig", newline="") as f:
+                rows = list(csv.DictReader(f))
+        mode = str(req.import_mode or "append").strip().lower()
+        if mode not in {"append", "replace"}:
+            mode = "append"
+        base_rows = []
+        if mode == "append":
+            for r in rows:
+                code = _normalize_symbol(str(r.get("股票代码", "")).strip())
+                if not code:
+                    continue
+                base_rows.append(
+                    {
+                        "股票代码": code,
+                        "市场标签": str(r.get("市场标签", "")).strip(),
+                        "行业标签": str(r.get("行业标签", "")).strip(),
+                        "市值标签": str(r.get("市值标签", "")).strip(),
+                        "是否启用": str(r.get("是否启用", "1")).strip() or "1",
+                    }
+                )
+        enabled_text = "1" if bool(req.enabled) else "0"
+        new_count = 0
+        updated_count = 0
+        if mode == "replace":
+            base_rows = []
+        row_map = {str(x.get("股票代码", "")).strip(): x for x in base_rows if str(x.get("股票代码", "")).strip()}
+        for code in uniq_codes:
+            existing = row_map.get(code)
+            if existing:
+                existing["市场标签"] = str(req.market_tag or existing.get("市场标签", "")).strip()
+                existing["行业标签"] = str(req.industry_tag or existing.get("行业标签", "")).strip()
+                existing["市值标签"] = str(req.size_tag or existing.get("市值标签", "")).strip()
+                existing["是否启用"] = enabled_text
+                updated_count += 1
+                continue
+            base_rows.append(
+                {
+                    "股票代码": code,
+                    "市场标签": str(req.market_tag or "").strip(),
+                    "行业标签": str(req.industry_tag or "").strip(),
+                    "市值标签": str(req.size_tag or "").strip(),
+                    "是否启用": enabled_text,
+                }
+            )
+            new_count += 1
+        with open(abs_path, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=field_names, extrasaction="ignore")
+            w.writeheader()
+            for row in base_rows:
+                w.writerow({k: row.get(k, "") for k in field_names})
+        return {
+            "status": "success",
+            "path": abs_path,
+            "mode": mode,
+            "input_count": len(uniq_codes),
+            "added_count": new_count,
+            "updated_count": updated_count,
+            "total_count": len(base_rows),
+            "invalid_lines": payload.get("invalid_lines", []),
+        }
+    except Exception as e:
+        logger.error(f"/api/blk/import_stock_pool failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.post("/api/batch/generate_tasks")
+async def api_batch_generate_tasks(req: BatchGenerateTasksRequest):
+    try:
+        mode = str(req.generate_mode or "append").strip().lower()
+        if mode not in {"append", "replace"}:
+            mode = "append"
+        max_tasks = int(req.generate_max_tasks or 0)
+        if max_tasks < 0:
+            max_tasks = 0
+        tasks_csv_abs = _resolve_batch_tasks_path(req.tasks_csv, DEFAULT_BATCH_TASKS_CSV, ensure_parent=True)
+        tasks_csv_rel = _project_rel_path(tasks_csv_abs)
+        cmd = [
+            sys.executable,
+            "scripts/batch_backtest_runner.py",
+            "--generate-tasks",
+            "--generate-mode",
+            mode,
+            "--generate-max-tasks",
+            str(max_tasks),
+            "--tasks-csv",
+            tasks_csv_rel,
+            "--generator-strategies-csv",
+            str(req.generator_strategies_csv or "data/任务生成_策略池.csv"),
+            "--generator-stocks-csv",
+            str(req.generator_stocks_csv or "data/任务生成_标的池.csv"),
+            "--generator-windows-csv",
+            str(req.generator_windows_csv or "data/任务生成_区间池.csv"),
+            "--generator-scenarios-csv",
+            str(req.generator_scenarios_csv or "data/任务生成_场景池.csv"),
+        ]
+        proc = subprocess.run(
+            cmd,
+            cwd=os.path.abspath("."),
+            capture_output=True,
+            text=True,
+            timeout=180
+        )
+        output = (proc.stdout or "") + ("\n" + proc.stderr if proc.stderr else "")
+        lines = [x for x in str(output).splitlines() if str(x).strip()]
+        tail = lines[-20:] if len(lines) > 20 else lines
+        if proc.returncode != 0:
+            return {
+                "status": "error",
+                "msg": "generate_tasks failed",
+                "returncode": int(proc.returncode),
+                "output_tail": tail,
+            }
+        return {
+            "status": "success",
+            "msg": "generate_tasks done",
+            "returncode": int(proc.returncode),
+            "output_tail": tail,
+            "tasks_csv": tasks_csv_rel,
+        }
+    except Exception as e:
+        logger.error(f"/api/batch/generate_tasks failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.post("/api/batch/strategy_pool/sync")
+async def api_batch_strategy_pool_sync(req: BatchStrategyPoolSyncRequest):
+    try:
+        path = os.path.abspath(str(req.strategy_pool_csv or "data/任务生成_策略池.csv"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        mode = str(req.mode or "replace").strip().lower()
+        if mode not in {"replace", "append"}:
+            mode = "replace"
+        ids: List[str] = []
+        if bool(req.use_all_enabled):
+            meta_rows = list_all_strategy_meta()
+            for m in meta_rows:
+                if not isinstance(m, dict):
+                    continue
+                if not bool(m.get("enabled", True)):
+                    continue
+                sid = str(m.get("id", "")).strip()
+                if sid:
+                    ids.append(sid)
+        else:
+            for raw in (req.strategy_ids or []):
+                sid = str(raw or "").strip()
+                if sid:
+                    ids.append(sid)
+        uniq_ids = []
+        seen = set()
+        for sid in ids:
+            if sid in seen:
+                continue
+            seen.add(sid)
+            uniq_ids.append(sid)
+        if not uniq_ids:
+            return {"status": "error", "msg": "no strategy ids resolved"}
+        rows = []
+        if mode == "append" and os.path.exists(path):
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                for r in csv.DictReader(f):
+                    sid = str(r.get("策略ID", r.get("strategy_id", ""))).strip()
+                    if sid:
+                        rows.append({"策略ID": sid, "是否启用": str(r.get("是否启用", r.get("enabled", "1")) or "1")})
+        row_map = {str(x.get("策略ID", "")).strip(): x for x in rows if str(x.get("策略ID", "")).strip()}
+        for sid in uniq_ids:
+            row_map[sid] = {"策略ID": sid, "是否启用": "1"}
+        merged_rows = sorted(list(row_map.values()), key=lambda x: str(x.get("策略ID", "")))
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["策略ID", "是否启用"], extrasaction="ignore")
+            w.writeheader()
+            for r in merged_rows:
+                w.writerow({"策略ID": r.get("策略ID", ""), "是否启用": r.get("是否启用", "1")})
+        return {
+            "status": "success",
+            "path": path,
+            "mode": mode,
+            "input_count": len(uniq_ids),
+            "total_count": len(merged_rows),
+            "strategy_ids": uniq_ids[:200],
+        }
+    except Exception as e:
+        logger.error(f"/api/batch/strategy_pool/sync failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+def _build_default_batch_combination(strategy_ids: List[str]) -> Dict[str, Any]:
+    ids = [str(x or "").strip() for x in (strategy_ids or []) if str(x or "").strip()]
+    n = len(ids)
+    use_vote = n >= 2
+    mode = "vote" if use_vote else "or"
+    min_agree = max(1, int(math.ceil(n * 0.6))) if use_vote else 1
+    weights = {sid: 1 for sid in ids}
+    return {
+        "enabled": True,
+        "mode": mode,
+        "min_agree_count": min_agree,
+        "tie_policy": "skip",
+        "weights": weights,
+    }
+
+
+def _extract_json_block(text: str) -> Dict[str, Any]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    m = re.search(r"\{[\s\S]*\}", raw)
+    if not m:
+        return {}
+    try:
+        obj = json.loads(m.group(0))
+        if isinstance(obj, dict):
+            return obj
+        return {}
+    except Exception:
+        return {}
+
+
+def _split_llm_json_and_markdown(text: str) -> tuple[Dict[str, Any], str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return {}, ""
+    lines = raw.splitlines()
+    json_lines = []
+    markdown_start = 0
+    balance = 0
+    started = False
+    for idx, line in enumerate(lines):
+        if not started and "{" not in line:
+            continue
+        if not started:
+            started = True
+        json_lines.append(line)
+        balance += line.count("{") - line.count("}")
+        if started and balance <= 0:
+            markdown_start = idx + 1
+            break
+    json_text = "\n".join(json_lines).strip()
+    parsed = _extract_json_block(json_text)
+    markdown = "\n".join(lines[markdown_start:]).strip() if markdown_start > 0 else raw
+    if parsed and markdown == json_text:
+        markdown = ""
+    return parsed if isinstance(parsed, dict) else {}, markdown.strip()
+
+
+def _extract_markdown_section(text: str, title: str, next_titles: list[str]) -> str:
+    raw = str(text or "")
+    if not raw or not title:
+        return ""
+    pattern = rf"(?:^|\n)\s*(?:#+\s*)?{re.escape(title)}\s*\n([\s\S]*?)$"
+    match = re.search(pattern, raw)
+    if not match:
+        return ""
+    body = match.group(1)
+    for next_title in next_titles:
+        split_pattern = rf"\n\s*(?:#+\s*)?{re.escape(next_title)}\s*\n"
+        split_match = re.search(split_pattern, body)
+        if split_match:
+            body = body[:split_match.start()]
+            break
+    return body.strip()
+
+
+def _extract_bullets(text: str) -> list[str]:
+    out = []
+    for line in str(text or "").splitlines():
+        item = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        if item:
+            out.append(item)
+    return out
+
+
+def _parse_key_value_items(text: str) -> list[Dict[str, Any]]:
+    items = []
+    for line in str(text or "").splitlines():
+        cleaned = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        if not cleaned:
+            continue
+        name, _, rest = cleaned.partition("：")
+        if not rest:
+            name, _, rest = cleaned.partition(":")
+        item = {
+            "name": name.strip() or cleaned,
+            "suggested": rest.strip() or cleaned,
+            "why": cleaned,
+        }
+        items.append(item)
+    return items
+
+
+def _normalize_ai_review_summary(raw: Dict[str, Any]) -> Dict[str, Any]:
+    data = raw if isinstance(raw, dict) else {}
+    title = str(data.get("title", "") or data.get("summary", "") or data.get("core_conclusion", "") or "").strip()
+    verdict = str(data.get("verdict", "") or data.get("stance", "") or "neutral").strip().lower() or "neutral"
+    score = data.get("score")
+    try:
+        score_value = max(0.0, min(100.0, float(score))) if score is not None else None
+    except Exception:
+        score_value = None
+    return {
+        "schema_version": AI_REVIEW_SUMMARY_SCHEMA_VERSION,
+        "source": str(data.get("source", "llm_json") or "llm_json"),
+        "title": title,
+        "verdict": verdict,
+        "score": score_value,
+        "highlights": [str(x or "").strip() for x in (data.get("highlights") or data.get("key_issues") or []) if str(x or "").strip()],
+        "risks": [str(x or "").strip() for x in (data.get("risks") or []) if str(x or "").strip()],
+        "buy_points": [x for x in (data.get("buy_points") or []) if isinstance(x, dict)],
+        "sell_points": [x for x in (data.get("sell_points") or []) if isinstance(x, dict)],
+        "parameter_suggestions": [x for x in (data.get("parameter_suggestions") or []) if isinstance(x, dict)],
+        "next_experiments": [x for x in (data.get("next_experiments") or []) if isinstance(x, dict)],
+    }
+
+
+def _normalize_buffett_review_summary(raw: Dict[str, Any]) -> Dict[str, Any]:
+    data = raw if isinstance(raw, dict) else {}
+    return {
+        "schema_version": BUFFETT_REVIEW_SUMMARY_SCHEMA_VERSION,
+        "source": str(data.get("source", "llm_json") or "llm_json"),
+        "title": str(data.get("title", "") or data.get("summary", "") or "").strip(),
+        "verdict": str(data.get("verdict", "") or "WATCH").strip().upper() or "WATCH",
+        "circle_of_competence": str(data.get("circle_of_competence", "") or "N/A").strip().upper() or "N/A",
+        "key_assumptions": [str(x or "").strip() for x in (data.get("key_assumptions") or []) if str(x or "").strip()],
+        "quality_assessment": [str(x or "").strip() for x in (data.get("quality_assessment") or []) if str(x or "").strip()],
+        "margin_of_safety": [str(x or "").strip() for x in (data.get("margin_of_safety") or []) if str(x or "").strip()],
+        "sell_checklist": [x for x in (data.get("sell_checklist") or []) if isinstance(x, dict)],
+        "top_risks": [str(x or "").strip() for x in (data.get("top_risks") or []) if str(x or "").strip()],
+        "monitoring_metrics": [str(x or "").strip() for x in (data.get("monitoring_metrics") or []) if str(x or "").strip()],
+        "final_note": str(data.get("final_note", "") or "").strip(),
+    }
+
+
+def _parse_ai_review_summary_from_markdown(markdown: str) -> Dict[str, Any]:
+    text = str(markdown or "").strip()
+    if not text:
+        return {}
+    sec1 = _extract_markdown_section(text, "1) 核心结论", ["2) 关键问题", "## 2) 关键问题"])
+    sec2 = _extract_markdown_section(text, "2) 关键问题", ["3) 基于交易明细的硅基节点分析", "## 3) 基于交易明细的硅基节点分析"])
+    sec3 = _extract_markdown_section(text, "3) 基于交易明细的硅基节点分析", ["4) 基于交易明细的流码节点分析", "## 4) 基于交易明细的流码节点分析"])
+    sec4 = _extract_markdown_section(text, "4) 基于交易明细的流码节点分析", ["5) 参数优化建议", "## 5) 参数优化建议"])
+    sec5 = _extract_markdown_section(text, "5) 参数优化建议", ["6) 下一轮实验方案", "## 6) 下一轮实验方案"])
+    sec6 = _extract_markdown_section(text, "6) 下一轮实验方案", [])
+    return _normalize_ai_review_summary({
+        "source": "markdown_parse",
+        "title": sec1.splitlines()[0].strip() if sec1 else "",
+        "verdict": "neutral",
+        "highlights": _extract_bullets(sec2) or ([sec2] if sec2 else []),
+        "risks": _extract_bullets(sec2),
+        "buy_points": [{"reason": item} for item in (_extract_bullets(sec3) or ([sec3] if sec3 else []))],
+        "sell_points": [{"reason": item} for item in (_extract_bullets(sec4) or ([sec4] if sec4 else []))],
+        "parameter_suggestions": _parse_key_value_items(sec5),
+        "next_experiments": [{"label": f"方案{idx + 1}", "expectation": item} for idx, item in enumerate(_extract_bullets(sec6) or ([sec6] if sec6 else []))],
+    })
+
+
+def _parse_buffett_review_summary_from_markdown(markdown: str) -> Dict[str, Any]:
+    text = str(markdown or "").strip()
+    if not text:
+        return {}
+    titles = [
+        "1) 结论（BUY/WATCH/HOLD/AVOID + 一句话理由）",
+        "2) 能力圈判断（IN/BOUNDARY/OUT）",
+        "3) 关键假设（3-5条）",
+        "4) 业务质量代理评估（用收益稳定性、回撤控制、策略一致性）",
+        "5) 安全边际代理评估（用风险收益比、回撤缓冲）",
+        "6) 流码标准检查（drawdown_break、win_rate_decay、ranking_drop、rule_stability）",
+        "7) 三大风险",
+        "8) 监控指标（季度/每轮回测跟踪项）",
+        "9) 最终结论（必须明确：仅分析，不执行交易）",
+    ]
+    sections = []
+    for idx, title in enumerate(titles):
+        sections.append(_extract_markdown_section(text, title, titles[idx + 1:]))
+    verdict_text = sections[0].splitlines()[0].strip() if sections[0] else "WATCH"
+    coc_text = sections[1].splitlines()[0].strip() if sections[1] else "N/A"
+    checklist = []
+    for item in _extract_bullets(sections[5]) or ([sections[5]] if sections[5] else []):
+        if not item:
+            continue
+        key, _, note = item.partition("：")
+        if not note:
+            key, _, note = item.partition(":")
+        checklist.append({
+            "key": key.strip() or item,
+            "status": "warn",
+            "note": note.strip() or item,
+        })
+    return _normalize_buffett_review_summary({
+        "source": "markdown_parse",
+        "title": verdict_text,
+        "verdict": verdict_text.split()[0].strip().upper() if verdict_text else "WATCH",
+        "circle_of_competence": coc_text.split()[0].strip().upper() if coc_text else "N/A",
+        "key_assumptions": _extract_bullets(sections[2]) or ([sections[2]] if sections[2] else []),
+        "quality_assessment": _extract_bullets(sections[3]) or ([sections[3]] if sections[3] else []),
+        "margin_of_safety": _extract_bullets(sections[4]) or ([sections[4]] if sections[4] else []),
+        "sell_checklist": checklist,
+        "top_risks": _extract_bullets(sections[6]) or ([sections[6]] if sections[6] else []),
+        "monitoring_metrics": _extract_bullets(sections[7]) or ([sections[7]] if sections[7] else []),
+        "final_note": sections[8],
+    })
+
+
+def _read_review_summary(report_item: Dict[str, Any], cache: Dict[str, Any], rid: str, field_name: str, version_field: str, expected_version: int, parser) -> Dict[str, Any]:
+    summary = cache.get(f"{rid}__summary")
+    summary_ver = int(cache.get(f"{rid}__summary_v", 0) or 0)
+    if isinstance(summary, dict) and summary_ver == expected_version:
+        return summary
+    persisted = report_item.get(field_name)
+    persisted_ver = int(report_item.get(version_field, 0) or 0)
+    if isinstance(persisted, dict) and persisted and persisted_ver == expected_version:
+        cache[f"{rid}__summary"] = persisted
+        cache[f"{rid}__summary_v"] = expected_version
+        return persisted
+    markdown = str(report_item.get("ai_review_text" if field_name.startswith("ai_") else "buffett_review_text", "") or "").strip()
+    parsed = parser(markdown) if markdown else {}
+    if isinstance(parsed, dict) and parsed:
+        cache[f"{rid}__summary"] = parsed
+        cache[f"{rid}__summary_v"] = expected_version
+        return parsed
+    return {}
+
+
+def _build_ai_review_payload(report_item: Dict[str, Any], report_id: str) -> Dict[str, Any]:
+    rid = str(report_id or "").strip()
+    text = (str(report_item.get("ai_review_text", "") or "") if int(report_item.get("ai_review_version", 0) or 0) == AI_REVIEW_SCHEMA_VERSION else "") or str(report_ai_review_cache.get(rid, "") or "")
+    summary = _read_review_summary(report_item, report_ai_review_cache, rid, "ai_review_summary", "ai_review_summary_version", AI_REVIEW_SUMMARY_SCHEMA_VERSION, _parse_ai_review_summary_from_markdown)
+    return {
+        "ai_review_text": str(text or ""),
+        "ai_review_version": int(report_item.get("ai_review_version", 0) or 0),
+        "ai_review_summary": summary,
+        "ai_review_summary_version": int(report_item.get("ai_review_summary_version", 0) or (AI_REVIEW_SUMMARY_SCHEMA_VERSION if summary else 0)),
+    }
+
+
+def _build_buffett_review_payload(report_item: Dict[str, Any], report_id: str) -> Dict[str, Any]:
+    rid = str(report_id or "").strip()
+    text = (str(report_item.get("buffett_review_text", "") or "") if int(report_item.get("buffett_review_version", 0) or 0) == BUFFETT_REVIEW_SCHEMA_VERSION else "") or str(report_buffett_review_cache.get(rid, "") or "")
+    summary = _read_review_summary(report_item, report_buffett_review_cache, rid, "buffett_review_summary", "buffett_review_summary_version", BUFFETT_REVIEW_SUMMARY_SCHEMA_VERSION, _parse_buffett_review_summary_from_markdown)
+    return {
+        "buffett_review_text": str(text or ""),
+        "buffett_review_version": int(report_item.get("buffett_review_version", 0) or 0),
+        "buffett_review_summary": summary,
+        "buffett_review_summary_version": int(report_item.get("buffett_review_summary_version", 0) or (BUFFETT_REVIEW_SUMMARY_SCHEMA_VERSION if summary else 0)),
+    }
+
+
+def _recommend_batch_combination_by_llm(strategy_ids: List[str], strategy_profiles: List[Dict[str, Any]], max_tokens: int, temperature: float) -> Dict[str, Any]:
+    cfg = ConfigLoader.reload()
+    api_key = str(cfg.get("data_provider.llm_api_key", "") or "").strip()
+    base_url = str(cfg.get("data_provider.llm_api_url", "") or "").strip()
+    model_name = str(cfg.get("data_provider.llm_model", "") or "gpt-4o-mini").strip()
+    if not api_key or not base_url:
+        raise RuntimeError("未配置 llm_api_url 或 llm_api_key")
+    payload_data = {
+        "strategy_ids": strategy_ids,
+        "strategy_profiles": strategy_profiles,
+        "defaults": _build_default_batch_combination(strategy_ids),
+    }
+    system_prompt = "你是A股量化组合参数顾问，擅长在多策略信号融合时提供可执行参数。"
+    user_prompt = (
+        "请根据输入策略列表，给出批量回测组合参数建议。\n"
+        "必须只返回JSON对象，不要输出Markdown，不要解释文本。\n"
+        "JSON结构固定：\n"
+        "{\n"
+        "  \"recommendation\": {\n"
+        "    \"enabled\": true,\n"
+        "    \"mode\": \"or|and|vote\",\n"
+        "    \"min_agree_count\": 1,\n"
+        "    \"tie_policy\": \"skip|buy|sell\",\n"
+        "    \"weights\": {\"策略ID\": 数值}\n"
+        "  },\n"
+        "  \"analysis\": \"给前端展示的简洁说明，100字以内\"\n"
+        "}\n"
+        "约束：\n"
+        "- recommendation.mode 只能是 or/and/vote。\n"
+        "- min_agree_count 必须是正整数，且不超过策略数量。\n"
+        "- weights 必须覆盖全部策略ID，权重为正数。\n"
+        "- 策略数>=2时优先使用 vote。\n"
+        f"输入数据：{json.dumps(payload_data, ensure_ascii=False)}"
+    )
+    url = base_url.rstrip("/")
+    if not url.endswith("/chat/completions"):
+        if url.endswith("/v1"):
+            url = f"{url}/chat/completions"
+        else:
+            url = f"{url}/v1/chat/completions"
+    payload = {
+        "model": model_name,
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    }
+    req = urllib.request.Request(
+        url=url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        raw = resp.read().decode("utf-8")
+    obj = json.loads(raw)
+    content = str(obj.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+    parsed = _extract_json_block(content)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("模型返回无法解析")
+    return parsed
+
+
+def _sanitize_batch_combination_recommendation(raw: Dict[str, Any], strategy_ids: List[str]) -> Dict[str, Any]:
+    sid_list = [str(x or "").strip() for x in (strategy_ids or []) if str(x or "").strip()]
+    sid_set = set(sid_list)
+    base = _build_default_batch_combination(sid_list)
+    rec_raw = raw.get("recommendation") if isinstance(raw.get("recommendation"), dict) else raw
+    mode = str(rec_raw.get("mode", base["mode"])).strip().lower()
+    if mode not in {"or", "and", "vote"}:
+        mode = base["mode"]
+    tie_policy = str(rec_raw.get("tie_policy", base["tie_policy"])).strip().lower()
+    if tie_policy not in {"skip", "buy", "sell"}:
+        tie_policy = base["tie_policy"]
+    min_agree_raw = rec_raw.get("min_agree_count", base["min_agree_count"])
+    try:
+        min_agree = int(float(min_agree_raw))
+    except Exception:
+        min_agree = int(base["min_agree_count"])
+    min_agree = max(1, min(len(sid_list) if sid_list else 1, min_agree))
+    weights_raw = rec_raw.get("weights") if isinstance(rec_raw.get("weights"), dict) else {}
+    weights: Dict[str, float] = {}
+    for sid in sid_list:
+        w = weights_raw.get(sid, 1)
+        try:
+            wv = float(w)
+        except Exception:
+            wv = 1.0
+        if not math.isfinite(wv) or wv <= 0:
+            wv = 1.0
+        weights[sid] = wv
+    for k, v in weights_raw.items():
+        sid = str(k or "").strip()
+        if not sid or sid not in sid_set:
+            continue
+        try:
+            wv = float(v)
+        except Exception:
+            continue
+        if not math.isfinite(wv) or wv <= 0:
+            continue
+        weights[sid] = wv
+    return {
+        "enabled": True,
+        "mode": mode,
+        "min_agree_count": min_agree,
+        "tie_policy": tie_policy,
+        "weights": weights,
+    }
+
+
+@app.post("/api/batch/combination/recommend")
+async def api_batch_combination_recommend(req: BatchCombinationRecommendRequest):
+    try:
+        sid_list = []
+        seen = set()
+        for raw in (req.strategy_ids or []):
+            sid = str(raw or "").strip()
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            sid_list.append(sid)
+        if not sid_list:
+            return {"status": "error", "msg": "strategy_ids is required"}
+        profile_map: Dict[str, Dict[str, Any]] = {}
+        for p in (req.strategy_profiles or []):
+            if not isinstance(p, dict):
+                continue
+            sid = str(p.get("strategy_id", "")).strip()
+            if not sid:
+                continue
+            profile_map[sid] = {
+                "strategy_id": sid,
+                "strategy_name": str(p.get("strategy_name", "")).strip(),
+                "score_hint": p.get("score_hint"),
+            }
+        ordered_profiles = [profile_map.get(sid, {"strategy_id": sid, "strategy_name": "", "score_hint": None}) for sid in sid_list]
+        fallback = _build_default_batch_combination(sid_list)
+        source = "rule"
+        analysis = f"默认建议：{len(sid_list)}个策略，采用{fallback['mode'].upper()}，最小同向数={fallback['min_agree_count']}，平票={fallback['tie_policy']}。"
+        rec = fallback
+        try:
+            max_tokens = max(256, min(2000, int(req.max_tokens or 600)))
+            temp = float(req.temperature if req.temperature is not None else 0.2)
+            llm_raw = _recommend_batch_combination_by_llm(
+                strategy_ids=sid_list,
+                strategy_profiles=ordered_profiles,
+                max_tokens=max_tokens,
+                temperature=temp,
+            )
+            rec = _sanitize_batch_combination_recommendation(llm_raw, sid_list)
+            source = "llm"
+            analysis = str(llm_raw.get("analysis", "") or "").strip() or analysis
+        except Exception as e:
+            logger.warning("batch combination llm fallback, err=%s", e)
+        return {
+            "status": "success",
+            "source": source,
+            "strategy_ids": sid_list,
+            "recommendation": rec,
+            "analysis": analysis,
+        }
+    except Exception as e:
+        logger.error(f"/api/batch/combination/recommend failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+def _append_batch_run_log(line: str) -> None:
+    with batch_run_lock:
+        logs = batch_run_state.setdefault("logs", [])
+        logs.append(str(line or "").rstrip("\n"))
+        if len(logs) > 800:
+            batch_run_state["logs"] = logs[-800:]
+
+
+def _normalize_batch_filter_list(text: str) -> List[str]:
+    parts = [x.strip() for x in str(text or "").replace("，", ",").split(",") if x.strip()]
+    uniq = []
+    seen = set()
+    for p in parts:
+        u = p.upper()
+        if u in seen:
+            continue
+        seen.add(u)
+        uniq.append(u)
+    return uniq
+
+
+def _is_batch_running() -> bool:
+    proc = batch_run_state.get("proc")
+    if proc is None:
+        return False
+    try:
+        return proc.poll() is None
+    except Exception:
+        return False
+
+
+def _batch_stream_reader(proc: subprocess.Popen) -> None:
+    try:
+        if proc.stdout is None:
+            return
+        for line in proc.stdout:
+            if line is None:
+                continue
+            _append_batch_run_log(str(line))
+    except Exception as e:
+        _append_batch_run_log(f"[reader_error] {e}")
+
+
+def _notify_batch_run_finished(rc: int, state_snapshot: Dict[str, Any]) -> None:
+    try:
+        tasks_csv = str(state_snapshot.get("tasks_csv") or DEFAULT_BATCH_TASKS_CSV)
+        results_csv = str(state_snapshot.get("results_csv") or "data/批量回测结果.csv")
+        summary_csv = str(state_snapshot.get("summary_csv") or "data/策略汇总评分.csv")
+        ai_md = str(state_snapshot.get("ai_analysis_output_md") or "data/批量回测AI分析.md")
+        batch_filter = str(state_snapshot.get("batch_no_filter") or "")
+        msg = (
+            f"批量回测已完成，exit={int(rc)}"
+            f"，任务={tasks_csv}，结果={results_csv}，汇总={summary_csv}"
+        )
+        if bool(state_snapshot.get("ai_analyze", False)):
+            msg = f"{msg}，AI分析={ai_md}"
+        if batch_filter:
+            msg = f"{msg}，批次过滤={batch_filter}"
+        notify_data = {
+            "msg": msg,
+            "level": "ok" if int(rc) == 0 else "warn",
+            "module": "批量回测",
+            "stock_codes": [],
+        }
+        if not _should_notify_webhook_by_category(event_type="system", data=notify_data):
+            return
+        asyncio.run(webhook_notifier.notify(event_type="system", data=notify_data, stock_code="MULTI"))
+    except Exception as e:
+        logger.error("batch finished webhook notify failed: %s", e, exc_info=True)
+
+
+def _batch_waiter(proc: subprocess.Popen) -> None:
+    try:
+        rc = proc.wait()
+    except Exception:
+        rc = -1
+    snapshot: Dict[str, Any] = {}
+    with batch_run_lock:
+        if batch_run_state.get("proc") is proc:
+            snapshot = {
+                "tasks_csv": batch_run_state.get("tasks_csv"),
+                "results_csv": batch_run_state.get("results_csv"),
+                "summary_csv": batch_run_state.get("summary_csv"),
+                "batch_no_filter": batch_run_state.get("batch_no_filter"),
+                "ai_analyze": bool(batch_run_state.get("ai_analyze", False)),
+                "ai_analysis_output_md": batch_run_state.get("ai_analysis_output_md"),
+            }
+            batch_run_state["returncode"] = int(rc)
+            batch_run_state["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            batch_run_state["proc"] = None
+    if snapshot:
+        _notify_batch_run_finished(int(rc), snapshot)
+
+
+def _batch_progress_snapshot(tasks_path: str, batch_no_filter: str) -> Dict[str, Any]:
+    if not os.path.exists(tasks_path):
+        return {"total": 0, "pending": 0, "retry": 0, "running": 0, "success": 0, "failed": 0, "progress": 0.0}
+    with open(tasks_path, "r", encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    batch_filters = set(_normalize_batch_filter_list(batch_no_filter))
+    use_filter = len(batch_filters) > 0
+    out = {"total": 0, "pending": 0, "retry": 0, "running": 0, "success": 0, "failed": 0}
+    status_alias = {
+        "ok": "success",
+        "done": "success",
+        "completed": "success",
+        "error": "failed",
+        "待执行": "pending",
+        "待处理": "pending",
+        "重试": "retry",
+        "运行中": "running",
+        "成功": "success",
+        "失败": "failed",
+    }
+    for r in rows:
+        bn = str(r.get("批次号", r.get("batch_no", "")) or "").strip().upper()
+        if use_filter and bn not in batch_filters:
+            continue
+        st_raw = str(r.get("任务状态", r.get("status", "")) or "").strip()
+        st = status_alias.get(st_raw, status_alias.get(st_raw.lower(), st_raw.lower() if st_raw else "pending"))
+        if st not in out:
+            st = "pending"
+        out["total"] += 1
+        out[st] += 1
+    total = max(0, int(out["total"]))
+    done = int(out["success"]) + int(out["failed"])
+    progress = float(done / total) if total > 0 else 0.0
+    out["progress"] = progress
+    return out
+
+
+@app.post("/api/batch/run/start")
+async def api_batch_run_start(req: BatchRunControlRequest):
+    try:
+        with batch_run_lock:
+            if _is_batch_running():
+                return {"status": "error", "msg": "batch run already running"}
+        tasks_csv_abs = _resolve_batch_tasks_path(req.tasks_csv, DEFAULT_BATCH_TASKS_CSV, ensure_parent=True)
+        tasks_csv_rel = _project_rel_path(tasks_csv_abs)
+        archive_csv_abs = _resolve_batch_tasks_path(req.archive_tasks_csv, DEFAULT_BATCH_ARCHIVE_CSV, ensure_parent=True)
+        archive_csv_rel = _project_rel_path(archive_csv_abs)
+        cmd = [
+            sys.executable,
+            "scripts/batch_backtest_runner.py",
+            "--tasks-csv", tasks_csv_rel,
+            "--results-csv", str(req.results_csv or "data/批量回测结果.csv"),
+            "--summary-csv", str(req.summary_csv or "data/策略汇总评分.csv"),
+            "--max-tasks", str(max(0, int(req.max_tasks or 0))),
+            "--parallel-workers", str(max(1, int(req.parallel_workers or 1))),
+            "--base-url", str(req.base_url or "http://127.0.0.1:8000"),
+            "--poll-seconds", str(max(1, int(req.poll_seconds or 3))),
+            "--status-log-seconds", str(max(1, int(req.status_log_seconds or 90))),
+            "--max-wait-seconds", str(max(60, int(req.max_wait_seconds or 7200))),
+            "--retry-sleep-seconds", str(max(1, int(req.retry_sleep_seconds or 3))),
+            "--rate-limit-interval-seconds", str(max(0.0, float(req.rate_limit_interval_seconds or 0.0))),
+        ]
+        base_urls = str(req.base_urls or "").strip()
+        if base_urls:
+            cmd.extend(["--base-urls", base_urls])
+        batch_no_filter = str(req.batch_no_filter or "").strip()
+        if batch_no_filter:
+            cmd.extend(["--batch-no-filter", batch_no_filter])
+        if bool(req.archive_completed):
+            cmd.append("--archive-completed")
+            cmd.extend(["--archive-tasks-csv", archive_csv_rel])
+        if bool(req.ai_analyze):
+            cmd.append("--ai-analyze")
+        if bool(req.ai_analyze_only):
+            cmd.append("--ai-analyze-only")
+        ai_output_md = str(req.ai_analysis_output_md or "data/批量回测AI分析.md").strip()
+        if ai_output_md:
+            cmd.extend(["--ai-analysis-output-md", ai_output_md])
+        ai_system_prompt = str(req.ai_analysis_system_prompt or "").strip()
+        if ai_system_prompt:
+            cmd.extend(["--ai-analysis-system-prompt", ai_system_prompt])
+        ai_prompt = str(req.ai_analysis_prompt or "").strip()
+        if ai_prompt:
+            cmd.extend(["--ai-analysis-prompt", ai_prompt])
+        cmd.extend(["--ai-analysis-max-results", str(max(1, int(req.ai_analysis_max_results or 200)))])
+        cmd.extend(["--ai-analysis-max-strategies", str(max(1, int(req.ai_analysis_max_strategies or 80)))])
+        cmd.extend(["--ai-analysis-temperature", str(float(req.ai_analysis_temperature if req.ai_analysis_temperature is not None else -1.0))])
+        cmd.extend(["--ai-analysis-max-tokens", str(max(256, int(req.ai_analysis_max_tokens or 1400)))])
+        cmd.extend(["--ai-analysis-timeout-sec", str(max(10, int(req.ai_analysis_timeout_sec or 60)))])
+        cwd = os.path.abspath(".")
+        proc = subprocess.Popen(
+            cmd,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        with batch_run_lock:
+            batch_run_state["proc"] = proc
+            batch_run_state["started_at"] = datetime.now().isoformat(timespec="seconds")
+            batch_run_state["finished_at"] = None
+            batch_run_state["returncode"] = None
+            batch_run_state["cmd"] = cmd
+            batch_run_state["cwd"] = cwd
+            batch_run_state["tasks_csv"] = tasks_csv_rel
+            batch_run_state["results_csv"] = str(req.results_csv or "data/批量回测结果.csv")
+            batch_run_state["summary_csv"] = str(req.summary_csv or "data/策略汇总评分.csv")
+            batch_run_state["batch_no_filter"] = batch_no_filter
+            batch_run_state["archive_completed"] = bool(req.archive_completed)
+            batch_run_state["archive_tasks_csv"] = archive_csv_rel
+            batch_run_state["max_tasks"] = max(0, int(req.max_tasks or 0))
+            batch_run_state["parallel_workers"] = max(1, int(req.parallel_workers or 1))
+            batch_run_state["ai_analyze"] = bool(req.ai_analyze)
+            batch_run_state["ai_analyze_only"] = bool(req.ai_analyze_only)
+            batch_run_state["ai_analysis_output_md"] = ai_output_md
+            batch_run_state["logs"] = [f"[start] {' '.join(cmd)}"]
+        t1 = threading.Thread(target=_batch_stream_reader, args=(proc,), daemon=True)
+        t2 = threading.Thread(target=_batch_waiter, args=(proc,), daemon=True)
+        t1.start()
+        t2.start()
+        return {
+            "status": "success",
+            "msg": "batch run started",
+            "pid": proc.pid,
+            "started_at": batch_run_state.get("started_at"),
+        }
+    except Exception as e:
+        logger.error(f"/api/batch/run/start failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.get("/api/batch/run/status")
+async def api_batch_run_status(tasks_csv: Optional[str] = None, batch_no_filter: Optional[str] = None, log_limit: int = 120):
+    try:
+        tasks_csv_abs = _resolve_batch_tasks_path(tasks_csv, str(batch_run_state.get("tasks_csv") or DEFAULT_BATCH_TASKS_CSV), ensure_parent=False)
+        tasks_csv_rel = _project_rel_path(tasks_csv_abs)
+        with batch_run_lock:
+            running = _is_batch_running()
+            proc = batch_run_state.get("proc")
+            state_copy = {
+                "started_at": batch_run_state.get("started_at"),
+                "finished_at": batch_run_state.get("finished_at"),
+                "returncode": batch_run_state.get("returncode"),
+                "cmd": list(batch_run_state.get("cmd") or []),
+                "cwd": batch_run_state.get("cwd"),
+                "tasks_csv": tasks_csv_rel,
+                "results_csv": batch_run_state.get("results_csv"),
+                "summary_csv": batch_run_state.get("summary_csv"),
+                "batch_no_filter": str(batch_no_filter if batch_no_filter is not None else batch_run_state.get("batch_no_filter") or ""),
+                "archive_completed": bool(batch_run_state.get("archive_completed", False)),
+                "archive_tasks_csv": batch_run_state.get("archive_tasks_csv"),
+                "max_tasks": int(batch_run_state.get("max_tasks", 0) or 0),
+                "parallel_workers": int(batch_run_state.get("parallel_workers", 1) or 1),
+                "ai_analyze": bool(batch_run_state.get("ai_analyze", False)),
+                "ai_analyze_only": bool(batch_run_state.get("ai_analyze_only", False)),
+                "ai_analysis_output_md": str(batch_run_state.get("ai_analysis_output_md") or "data/批量回测AI分析.md"),
+                "pid": int(proc.pid) if proc is not None else None,
+                "logs": list(batch_run_state.get("logs") or []),
+            }
+        snap = _batch_progress_snapshot(
+            tasks_path=tasks_csv_abs,
+            batch_no_filter=state_copy["batch_no_filter"],
+        )
+        limit = max(20, min(500, int(log_limit or 120)))
+        logs = state_copy["logs"][-limit:] if state_copy["logs"] else []
+        return {
+            "status": "success",
+            "running": running,
+            "pid": state_copy["pid"],
+            "started_at": state_copy["started_at"],
+            "finished_at": state_copy["finished_at"],
+            "returncode": state_copy["returncode"],
+            "config": {
+                "tasks_csv": state_copy["tasks_csv"],
+                "results_csv": state_copy["results_csv"],
+                "summary_csv": state_copy["summary_csv"],
+                "batch_no_filter": state_copy["batch_no_filter"],
+                "archive_completed": state_copy["archive_completed"],
+                "archive_tasks_csv": state_copy["archive_tasks_csv"],
+                "max_tasks": state_copy["max_tasks"],
+                "parallel_workers": state_copy["parallel_workers"],
+                "ai_analyze": state_copy["ai_analyze"],
+                "ai_analyze_only": state_copy["ai_analyze_only"],
+                "ai_analysis_output_md": state_copy["ai_analysis_output_md"],
+            },
+            "progress": snap,
+            "log_tail": logs,
+            "last_log": logs[-1] if logs else "",
+        }
+    except Exception as e:
+        logger.error(f"/api/batch/run/status failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.post("/api/batch/run/stop")
+async def api_batch_run_stop():
+    try:
+        with batch_run_lock:
+            proc = batch_run_state.get("proc")
+            if proc is None or proc.poll() is not None:
+                return {"status": "success", "msg": "no running batch process"}
+            pid = proc.pid
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                proc.kill()
+        finally:
+            with batch_run_lock:
+                if batch_run_state.get("proc") is proc:
+                    batch_run_state["proc"] = None
+                    batch_run_state["returncode"] = int(proc.returncode) if proc.returncode is not None else -1
+                    batch_run_state["finished_at"] = datetime.now().isoformat(timespec="seconds")
+                    logs = batch_run_state.setdefault("logs", [])
+                    logs.append(f"[stop] pid={pid}")
+                    if len(logs) > 800:
+                        batch_run_state["logs"] = logs[-800:]
+        return {"status": "success", "msg": f"batch process stopped pid={pid}"}
+    except Exception as e:
+        logger.error(f"/api/batch/run/stop failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.get("/api/batch/overview")
+async def api_batch_overview(
+    tasks_csv: str = DEFAULT_BATCH_TASKS_CSV,
+    results_csv: str = "data/批量回测结果.csv",
+    summary_csv: str = "data/策略汇总评分.csv",
+    limit: int = 300
+):
+    try:
+        lim = max(10, min(2000, int(limit or 300)))
+        tasks_path = _resolve_batch_tasks_path(tasks_csv, DEFAULT_BATCH_TASKS_CSV, ensure_parent=False)
+        results_path = os.path.abspath(str(results_csv or "data/批量回测结果.csv"))
+        summary_path = os.path.abspath(str(summary_csv or "data/策略汇总评分.csv"))
+
+        def _read_csv(path: str) -> List[Dict[str, Any]]:
+            if not os.path.exists(path):
+                return []
+            with open(path, "r", encoding="utf-8-sig", newline="") as f:
+                return list(csv.DictReader(f))
+
+        def _to_float(v: Any, default: float = 0.0) -> float:
+            try:
+                return float(v)
+            except Exception:
+                return default
+
+        def _to_int(v: Any, default: int = 0) -> int:
+            try:
+                return int(float(v))
+            except Exception:
+                return default
+
+        def _norm_status(v: Any) -> str:
+            t = str(v or "").strip().lower()
+            alias = {
+                "ok": "success",
+                "done": "success",
+                "completed": "success",
+                "error": "failed",
+            }
+            return alias.get(t, t if t else "pending")
+
+        tasks_rows = _read_csv(tasks_path)
+        results_rows = _read_csv(results_path)
+        summary_rows = _read_csv(summary_path)
+
+        batch_stats: Dict[str, Dict[str, Any]] = {}
+        status_counter: Dict[str, int] = {}
+        for row in tasks_rows:
+            st = _norm_status(row.get("任务状态", row.get("status", "")))
+            status_counter[st] = int(status_counter.get(st, 0)) + 1
+            bn = str(row.get("批次号", row.get("batch_no", "")) or "GEN").strip() or "GEN"
+            item = batch_stats.setdefault(bn, {"batch_no": bn, "total": 0, "pending": 0, "running": 0, "retry": 0, "success": 0, "failed": 0})
+            item["total"] += 1
+            if st in item:
+                item[st] += 1
+
+        sorted_results = sorted(
+            [x for x in results_rows if isinstance(x, dict)],
+            key=lambda x: str(x.get("任务ID", x.get("task_id", ""))),
+            reverse=True,
+        )
+        recent_rows = []
+        for r in sorted_results[:lim]:
+            sid = str(r.get("策略ID", r.get("strategy_id", ""))).strip()
+            total_return = _to_float(r.get("总收益", r.get("total_return", 0.0)), 0.0)
+            annualized = _to_float(r.get("年化收益", r.get("annualized_return", 0.0)), 0.0)
+            max_dd = _to_float(r.get("最大回撤", r.get("max_drawdown", 0.0)), 0.0)
+            score = _to_float(r.get("综合评分", r.get("score_final", 0.0)), 0.0)
+            recent_rows.append({
+                "task_id": str(r.get("任务ID", r.get("task_id", ""))),
+                "batch_no": str(r.get("批次号", r.get("batch_no", ""))),
+                "stock_code": str(r.get("股票代码", r.get("stock_code", ""))),
+                "strategy_id": sid,
+                "scenario_tag": str(r.get("场景标签", r.get("scenario_tag", ""))),
+                "report_id": str(r.get("报告ID", r.get("report_id", ""))),
+                "grade": str(r.get("评级", r.get("grade", ""))),
+                "score_final": score,
+                "total_return": total_return,
+                "annualized_return": annualized,
+                "max_drawdown": max_dd,
+                "win_rate": _to_float(r.get("胜率", r.get("win_rate", 0.0)), 0.0),
+                "trade_count": _to_int(r.get("总交易数", r.get("total_trades", 0)), 0),
+            })
+
+        strategy_board = []
+        if summary_rows:
+            for s in summary_rows[:lim]:
+                strategy_board.append({
+                    "strategy_id": str(s.get("策略ID", s.get("strategy_id", ""))),
+                    "task_count": _to_int(s.get("任务数", s.get("task_count", 0)), 0),
+                    "success_count": _to_int(s.get("成功数", s.get("success_count", 0)), 0),
+                    "median_score_final": _to_float(s.get("综合评分中位数", s.get("median_score_final", 0.0)), 0.0),
+                    "median_annualized_return": _to_float(s.get("年化收益中位数", s.get("median_annualized_return", 0.0)), 0.0),
+                    "median_max_drawdown": _to_float(s.get("最大回撤中位数", s.get("median_max_drawdown", 0.0)), 0.0),
+                    "median_win_rate": _to_float(s.get("胜率中位数", s.get("median_win_rate", 0.0)), 0.0),
+                    "grade": str(s.get("评级", s.get("grade", ""))),
+                    "decision": str(s.get("建议动作", s.get("decision", ""))),
+                })
+        else:
+            agg: Dict[str, Dict[str, Any]] = {}
+            for r in recent_rows:
+                sid = str(r.get("strategy_id", "")).strip() or "UNKNOWN"
+                stat = agg.setdefault(sid, {"strategy_id": sid, "task_count": 0, "success_count": 0, "sum_score": 0.0, "sum_annual": 0.0, "sum_dd": 0.0, "sum_wr": 0.0})
+                stat["task_count"] += 1
+                stat["success_count"] += 1
+                stat["sum_score"] += _to_float(r.get("score_final", 0.0), 0.0)
+                stat["sum_annual"] += _to_float(r.get("annualized_return", 0.0), 0.0)
+                stat["sum_dd"] += _to_float(r.get("max_drawdown", 0.0), 0.0)
+                stat["sum_wr"] += _to_float(r.get("win_rate", 0.0), 0.0)
+            for sid, stat in agg.items():
+                n = max(1, int(stat["task_count"]))
+                strategy_board.append({
+                    "strategy_id": sid,
+                    "task_count": int(stat["task_count"]),
+                    "success_count": int(stat["success_count"]),
+                    "median_score_final": float(stat["sum_score"] / n),
+                    "median_annualized_return": float(stat["sum_annual"] / n),
+                    "median_max_drawdown": float(stat["sum_dd"] / n),
+                    "median_win_rate": float(stat["sum_wr"] / n),
+                    "grade": "",
+                    "decision": "",
+                })
+            strategy_board = sorted(strategy_board, key=lambda x: float(x.get("median_score_final", 0.0)), reverse=True)
+
+        payload = {
+            "status": "success",
+            "meta": {
+                "tasks_csv": tasks_path,
+                "results_csv": results_path,
+                "summary_csv": summary_path,
+                "task_count": len(tasks_rows),
+                "result_count": len(results_rows),
+                "summary_count": len(summary_rows),
+            },
+            "task_status": status_counter,
+            "batch_stats": sorted(list(batch_stats.values()), key=lambda x: str(x.get("batch_no", ""))),
+            "strategy_board": strategy_board[:100],
+            "recent_results": recent_rows,
+        }
+        payload = _sanitize_non_finite(payload)
+        safe_payload = _safe_json_obj(payload)
+        if isinstance(safe_payload, dict):
+            return safe_payload
+        return {"status": "error", "msg": "invalid payload"}
+    except Exception as e:
+        logger.error(f"/api/batch/overview failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.get("/api/batch/tasks_csv/list")
+async def api_batch_tasks_csv_list(limit: int = 300, include_archive: bool = True):
+    try:
+        root_abs = os.path.abspath(os.path.join(PROJECT_ROOT, BATCH_TASKS_DIR))
+        os.makedirs(root_abs, exist_ok=True)
+        lim = max(20, min(3000, int(limit or 300)))
+        files = []
+        for dirpath, _, filenames in os.walk(root_abs):
+            for name in filenames:
+                if not str(name).lower().endswith(".csv"):
+                    continue
+                abs_path = os.path.join(dirpath, name)
+                rel_project = _project_rel_path(abs_path)
+                rel_in_root = os.path.relpath(abs_path, root_abs).replace("\\", "/")
+                is_archive = rel_in_root.lower().startswith("archive/")
+                if not include_archive and is_archive:
+                    continue
+                try:
+                    st = os.stat(abs_path)
+                    mtime = datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds")
+                    size = int(st.st_size)
+                except Exception:
+                    mtime = ""
+                    size = 0
+                files.append({
+                    "path": rel_project,
+                    "name": name,
+                    "mtime": mtime,
+                    "size": size,
+                    "is_archive": is_archive,
+                })
+        files.sort(key=lambda x: str(x.get("mtime", "")), reverse=True)
+        return {
+            "status": "success",
+            "root_dir": _project_rel_path(root_abs),
+            "default_tasks_csv": _project_rel_path(os.path.join(PROJECT_ROOT, DEFAULT_BATCH_TASKS_CSV)),
+            "default_archive_csv": _project_rel_path(os.path.join(PROJECT_ROOT, DEFAULT_BATCH_ARCHIVE_CSV)),
+            "files": files[:lim],
+        }
+    except Exception as e:
+        logger.error(f"/api/batch/tasks_csv/list failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.post("/api/batch/tasks_csv/create_template")
+async def api_batch_tasks_csv_create_template(req: BatchTaskCsvCreateRequest):
+    try:
+        raw_prefix = str(req.prefix or "").strip()
+        raw_name = str(req.file_name or "").strip()
+        clean_prefix = re.sub(r'[\\/:*?"<>|]+', "_", raw_prefix).replace(" ", "_")[:48]
+        clean_name = re.sub(r'[\\/:*?"<>|]+', "_", raw_name).strip()
+        if clean_name:
+            if not clean_name.lower().endswith(".csv"):
+                clean_name = f"{clean_name}.csv"
+            rel_path = os.path.join(BATCH_TASKS_DIR, clean_name).replace("\\", "/")
+        else:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            rel_path = os.path.join(BATCH_TASKS_DIR, f"{clean_prefix}批量回测任务_{stamp}.csv").replace("\\", "/")
+        abs_path = _resolve_batch_tasks_path(rel_path, DEFAULT_BATCH_TASKS_CSV, ensure_parent=True)
+        rel_project = _project_rel_path(abs_path)
+        if os.path.exists(abs_path) and not bool(req.overwrite):
+            return {"status": "error", "msg": f"file already exists: {rel_project}"}
+        with open(abs_path, "w", encoding="utf-8-sig", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=BATCH_TASK_TEMPLATE_HEADERS, extrasaction="ignore")
+            w.writeheader()
+        return {
+            "status": "success",
+            "path": rel_project,
+            "headers": list(BATCH_TASK_TEMPLATE_HEADERS),
+            "overwrite": bool(req.overwrite),
+        }
+    except Exception as e:
+        logger.error(f"/api/batch/tasks_csv/create_template failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.get("/api/batch/tasks_preview")
+async def api_batch_tasks_preview(
+    tasks_csv: str = DEFAULT_BATCH_TASKS_CSV,
+    batch_no_filter: str = "",
+    status_filter: str = "",
+    limit: int = 500
+):
+    try:
+        path = _resolve_batch_tasks_path(tasks_csv, DEFAULT_BATCH_TASKS_CSV, ensure_parent=False)
+        if not os.path.exists(path):
+            return {"status": "success", "path": path, "total": 0, "rows": []}
+        with open(path, "r", encoding="utf-8-sig", newline="") as f:
+            rows = list(csv.DictReader(f))
+        lim = max(20, min(3000, int(limit or 500)))
+        batch_filters = [x.strip().upper() for x in str(batch_no_filter or "").replace("，", ",").split(",") if x.strip()]
+        batch_set = set(batch_filters)
+        st_filter = str(status_filter or "").strip().lower()
+        status_alias = {
+            "ok": "success",
+            "done": "success",
+            "completed": "success",
+            "error": "failed",
+            "待执行": "pending",
+            "待处理": "pending",
+            "重试": "retry",
+            "运行中": "running",
+            "成功": "success",
+            "失败": "failed",
+        }
+        out = []
+        total = 0
+        for r in rows:
+            bn = str(r.get("批次号", r.get("batch_no", "")) or "").strip()
+            if batch_set and bn.upper() not in batch_set:
+                continue
+            st_raw = str(r.get("任务状态", r.get("status", "")) or "").strip()
+            st = status_alias.get(st_raw, status_alias.get(st_raw.lower(), st_raw.lower() if st_raw else "pending"))
+            if st_filter and st_filter not in {"all", "*"} and st != st_filter:
+                continue
+            total += 1
+            out.append({
+                "task_id": str(r.get("任务ID", r.get("task_id", ""))),
+                "batch_no": bn,
+                "priority": str(r.get("优先级", r.get("priority", ""))),
+                "enabled": str(r.get("是否启用", r.get("enabled", ""))),
+                "stock_code": str(r.get("股票代码", r.get("stock_code", ""))),
+                "strategy_id": str(r.get("策略ID", r.get("strategy_id", ""))),
+                "start_date": str(r.get("开始日期", r.get("start_date", ""))),
+                "end_date": str(r.get("结束日期", r.get("end_date", ""))),
+                "capital": str(r.get("初始资金", r.get("capital", ""))),
+                "kline_type": str(r.get("K线周期", r.get("kline_type", ""))),
+                "data_source": str(r.get("数据源", r.get("data_source", ""))),
+                "scenario_tag": str(r.get("场景标签", r.get("scenario_tag", ""))),
+                "cost_profile": str(r.get("成本档位", r.get("cost_profile", ""))),
+                "slippage_bp": str(r.get("滑点BP", r.get("slippage_bp", ""))),
+                "commission_rate": str(r.get("佣金费率", r.get("commission_rate", ""))),
+                "stamp_tax_rate": str(r.get("印花税率", r.get("stamp_tax_rate", ""))),
+                "min_lot": str(r.get("最小手数", r.get("min_lot", ""))),
+                "enforce_t1": str(r.get("是否T1", r.get("enforce_t1", ""))),
+                "max_retry": str(r.get("最大重试", r.get("max_retry", ""))),
+                "status": st,
+                "report_id": str(r.get("报告ID", r.get("report_id", ""))),
+                "error_msg": str(r.get("错误信息", r.get("error_msg", ""))),
+                "created_at": str(r.get("创建时间", r.get("created_at", ""))),
+                "updated_at": str(r.get("更新时间", r.get("updated_at", ""))),
+            })
+            if len(out) >= lim:
+                break
+        return {
+            "status": "success",
+            "path": path,
+            "total": int(total),
+            "rows": out,
+        }
+    except Exception as e:
+        logger.error(f"/api/batch/tasks_preview failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.post("/api/strategy_manager/add")
+async def api_strategy_manager_add(req: StrategyAddRequest):
+    try:
+        sid = str(req.strategy_id or "").strip()
+        if not sid:
+            return {"status": "error", "msg": "strategy_id is required"}
+        if _find_strategy_meta(sid) is not None:
+            return {"status": "error", "msg": f"strategy id already exists: {sid}"}
+        depends_on = _normalize_depends_on(req.depends_on)
+        missing = [x for x in depends_on if _find_strategy_meta(x) is None]
+        if missing:
+            return {"status": "error", "msg": f"depends_on not found: {','.join(missing)}"}
+        kline_type = _normalize_kline_type(req.kline_type)
+        code_text = _apply_kline_type_to_code(req.code, kline_type)
+        class_name = _extract_first_class_name(code_text) or (req.class_name or "")
+        strategy_intent = req.strategy_intent
+        if not isinstance(strategy_intent, dict):
+            source = str(req.source or "").strip().lower()
+            if source == "market":
+                strategy_intent = intent_engine.from_market_analysis({}).to_dict()
+            else:
+                strategy_intent = intent_engine.from_human_input(req.template_text or req.analysis_text or req.strategy_name).to_dict()
+        add_custom_strategy({
+            "id": req.strategy_id,
+            "name": req.strategy_name,
+            "class_name": class_name,
+            "code": code_text,
+            "template_text": req.template_text or "",
+            "analysis_text": req.analysis_text or "",
+            "strategy_intent": strategy_intent,
+            "source": req.source or "",
+            "kline_type": kline_type,
+            "depends_on": depends_on,
+            "protect_level": req.protect_level or "custom",
+            "immutable": bool(req.immutable) if req.immutable is not None else False,
+            "raw_requirement_title": req.raw_requirement_title or "",
+            "raw_requirement": req.raw_requirement or ""
+        })
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"/api/strategy_manager/add failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.post("/api/strategy_manager/update")
+async def api_strategy_manager_update(req: StrategyUpdateRequest):
+    try:
+        sid = str(req.strategy_id or "").strip()
+        if not sid:
+            return {"status": "error", "msg": "strategy_id is required"}
+        if is_builtin_strategy_id(sid):
+            return {"status": "error", "msg": f"builtin strategy {sid} is not editable"}
+        if _is_protected_strategy(sid):
+            return {"status": "error", "msg": f"strategy {sid} is protected and cannot be updated"}
+        if _find_strategy_meta(sid) is None:
+            return {"status": "error", "msg": f"strategy not found: {sid}"}
+        payload = {"id": sid}
+        if req.strategy_name is not None:
+            payload["name"] = req.strategy_name
+        if req.class_name is not None:
+            payload["class_name"] = req.class_name
+        if req.code is not None:
+            code_text = req.code
+            if req.kline_type is not None:
+                code_text = _apply_kline_type_to_code(code_text, req.kline_type)
+            payload["code"] = code_text
+            if not req.class_name:
+                payload["class_name"] = _extract_first_class_name(code_text)
+        if req.analysis_text is not None:
+            payload["analysis_text"] = req.analysis_text
+        if req.source is not None:
+            payload["source"] = req.source
+        if req.kline_type is not None:
+            payload["kline_type"] = _normalize_kline_type(req.kline_type)
+        if req.raw_requirement_title is not None:
+            payload["raw_requirement_title"] = req.raw_requirement_title
+        if req.raw_requirement is not None:
+            payload["raw_requirement"] = req.raw_requirement
+        if req.depends_on is not None:
+            depends_on = _normalize_depends_on(req.depends_on)
+            if sid in depends_on:
+                return {"status": "error", "msg": "strategy cannot depend on itself"}
+            missing = [x for x in depends_on if _find_strategy_meta(x) is None]
+            if missing:
+                return {"status": "error", "msg": f"depends_on not found: {','.join(missing)}"}
+            payload["depends_on"] = depends_on
+        if req.protect_level is not None:
+            payload["protect_level"] = req.protect_level
+        if req.immutable is not None:
+            payload["immutable"] = bool(req.immutable)
+        update_custom_strategy(payload)
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"/api/strategy_manager/update failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.post("/api/strategy_manager/delete")
+async def api_strategy_manager_delete(req: StrategyDeleteRequest):
+    try:
+        sid = str(req.strategy_id or "").strip()
+        if not sid:
+            return {"status": "error", "msg": "strategy_id is required"}
+        if not req.force:
+            return {"status": "error", "msg": "请勾选强制删除后再执行删除"}
+        deleted = delete_strategy(sid)
+        return {"status": "success" if deleted else "info", "deleted": bool(deleted)}
+    except Exception as e:
+        logger.error(f"/api/strategy_manager/delete failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+@app.get("/api/config")
+async def api_get_config():
+    try:
+        cfg = ConfigLoader.reload()
+        payload = _mask_secret_config(cfg.to_dict())
+        return {"status": "success", "config": payload, "webhook_category_options": WEBHOOK_CATEGORY_OPTIONS}
+    except Exception as e:
+        logger.error(f"/api/config failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e), "config": {}}
+
+@app.post("/api/config/save")
+async def api_save_config(req: ConfigUpdateRequest):
+    global config, cabinet_task, current_cabinet, current_provider_source
+    try:
+        if not isinstance(req.config, dict):
+            return {"status": "error", "msg": "config must be object"}
+        config = _save_split_config(req.config)
+        applied_log_level = _apply_log_level(config)
+        current_provider_source = config.get("data_provider.source", "default")
+        live_enabled = is_live_enabled()
+        restarted = False
+        running_codes = _live_running_codes()
+        if running_codes:
+            await _stop_live_tasks(running_codes)
+            if live_enabled:
+                for stock_code in running_codes:
+                    live_tasks[stock_code] = asyncio.create_task(run_cabinet_task(stock_code))
+                restarted = True
+        await manager.broadcast({"type": "system", "data": {"msg": "配置已更新并生效"}})
+        return {"status": "success", "msg": "config saved", "live_restarted": restarted, "live_enabled": live_enabled, "log_level": applied_log_level, "mode": _system_mode(config)}
+    except Exception as e:
+        logger.error(f"/api/config/save failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+@app.post("/api/config/test_tushare_connectivity")
+async def api_test_tushare_connectivity(req: TushareConnectivityTestRequest):
+    try:
+        cfg = ConfigLoader.reload()
+        raw_url = req.api_url
+        if raw_url is None:
+            raw_url = cfg.get("data_provider.tushare_api_url", "http://tushare.xyz")
+        api_url = str(raw_url or "").strip().strip("`'\" ").strip()
+        req_token = str(req.token or "").strip()
+        token = req_token if req_token else str(cfg.get("data_provider.tushare_token", "") or "").strip()
+        stock_code = str(req.stock_code or "").strip().upper() or "000001.SZ"
+        if not api_url:
+            return {"status": "error", "msg": "tushare_api_url 不能为空"}
+        if not token:
+            return {"status": "error", "msg": "tushare_token 未配置（请在 private/config 配置后重试）"}
+
+        provider = TushareProvider(token=token)
+        provider._tushare_http_url = api_url
+        provider.set_token(token)
+        ok, detail = provider.check_connectivity(stock_code)
+        if ok:
+            return {
+                "status": "success",
+                "ok": True,
+                "msg": "Tushare 连通性校验通过",
+                "api_url": api_url,
+                "stock_code": stock_code,
+                "detail": str(detail or "ok")
+            }
+        return {
+            "status": "error",
+            "ok": False,
+            "msg": str(detail or provider.last_error or "连通性校验失败"),
+            "api_url": api_url,
+            "stock_code": stock_code
+        }
+    except Exception as e:
+        logger.error(f"/api/config/test_tushare_connectivity failed: {e}", exc_info=True)
+        return {"status": "error", "ok": False, "msg": str(e)}
+
+
+def _normalize_tdxdir_path(path: str) -> str:
+    p = str(path or "").strip().strip("`'\" ").strip()
+    if not p:
+        return ""
+    p = os.path.expandvars(os.path.expanduser(p))
+    try:
+        return os.path.normpath(p)
+    except Exception:
+        return p
+
+
+def _is_valid_tdxdir(path: str) -> bool:
+    p = _normalize_tdxdir_path(path)
+    if not p:
+        return False
+    try:
+        if not os.path.isdir(p):
+            return False
+        vipdoc = os.path.join(p, "vipdoc")
+        return os.path.isdir(vipdoc)
+    except Exception:
+        return False
+
+
+def _detect_tdxdir_candidates(limit: int = 8) -> List[str]:
+    seed_paths: List[str] = []
+    cfg = ConfigLoader.reload()
+    seed_paths.append(str(os.environ.get("TDX_DIR", "") or "").strip())
+    seed_paths.append(str(cfg.get("data_provider.tdxdir", "") or cfg.get("data_provider.tdx_dir", "") or "").strip())
+
+    common_suffix = ["new_tdx", "tdx", "TdxW", "TdxW_HuaTai"]
+    base_roots = [
+        r"C:\\",
+        r"D:\\",
+        r"E:\\",
+        r"F:\\",
+        r"C:\\Program Files\\",
+        r"C:\\Program Files (x86)\\",
+    ]
+    for root in base_roots:
+        root_n = _normalize_tdxdir_path(root)
+        if not root_n or (not os.path.isdir(root_n)):
+            continue
+        for name in common_suffix:
+            seed_paths.append(os.path.join(root_n, name))
+
+    # Quick shallow scan for folders containing "tdx" under Program Files roots.
+    for pf in [r"C:\\Program Files\\", r"C:\\Program Files (x86)\\"]:
+        pf_n = _normalize_tdxdir_path(pf)
+        if not pf_n or (not os.path.isdir(pf_n)):
+            continue
+        try:
+            for entry in os.scandir(pf_n):
+                if not entry.is_dir():
+                    continue
+                nm = str(entry.name or "").lower()
+                if "tdx" in nm or "tongda" in nm:
+                    seed_paths.append(entry.path)
+        except Exception:
+            continue
+
+    out: List[str] = []
+    seen = set()
+    for raw in seed_paths:
+        p = _normalize_tdxdir_path(raw)
+        if not p:
+            continue
+        if p in seen:
+            continue
+        seen.add(p)
+        if _is_valid_tdxdir(p):
+            out.append(p)
+        if len(out) >= max(1, int(limit or 8)):
+            break
+    return out
+
+
+@app.post("/api/config/test_tdx_connectivity")
+async def api_test_tdx_connectivity(req: TdxConnectivityTestRequest):
+    try:
+        cfg = ConfigLoader.reload()
+        stock_code = str(req.stock_code or "").strip().upper() or "000001.SZ"
+        cfg_tdxdir = str(cfg.get("data_provider.tdxdir", "") or cfg.get("data_provider.tdx_dir", "") or "").strip()
+        req_tdxdir = str(req.tdxdir or "").strip()
+        tdxdir = _normalize_tdxdir_path(req_tdxdir or cfg_tdxdir)
+        candidates = _detect_tdxdir_candidates(limit=8) if bool(req.auto_detect) else []
+        autodetected = False
+
+        if (not _is_valid_tdxdir(tdxdir)) and candidates:
+            tdxdir = candidates[0]
+            autodetected = True
+
+        if not _is_valid_tdxdir(tdxdir):
+            provider = TdxProvider(tdxdir=tdxdir)
+            ok, detail = provider.check_connectivity(stock_code)
+            mode_info = provider.describe_mode() if hasattr(provider, "describe_mode") else {}
+            if ok:
+                return {
+                    "status": "success",
+                    "ok": True,
+                    "msg": "TDX(Mootdx) 连通性校验通过（当前使用网络镜像模式）",
+                    "stock_code": stock_code,
+                    "tdxdir_used": "",
+                    "autodetected": autodetected,
+                    "candidates": candidates,
+                    "detail": str(detail or "ok"),
+                    "provider_mode": mode_info.get("provider_mode", "network_mirror"),
+                    "cache_dir": mode_info.get("cache_dir", ""),
+                    "has_vipdoc": bool(mode_info.get("has_vipdoc", False)),
+                }
+            return {
+                "status": "error",
+                "ok": False,
+                "msg": str(detail or provider.last_error or "未找到可用通达信数据目录（需包含 vipdoc），且网络镜像模式不可用"),
+                "stock_code": stock_code,
+                "tdxdir_used": "",
+                "candidates": candidates,
+                "provider_mode": mode_info.get("provider_mode", "network_mirror"),
+                "cache_dir": mode_info.get("cache_dir", ""),
+                "has_vipdoc": bool(mode_info.get("has_vipdoc", False)),
+            }
+
+        provider = TdxProvider(tdxdir=tdxdir)
+        ok, detail = provider.check_connectivity(stock_code)
+        mode_info = provider.describe_mode() if hasattr(provider, "describe_mode") else {}
+        if ok:
+            return {
+                "status": "success",
+                "ok": True,
+                "msg": "TDX(Mootdx) 连通性校验通过",
+                "stock_code": stock_code,
+                "tdxdir_used": tdxdir,
+                "autodetected": autodetected,
+                "candidates": candidates,
+                "detail": str(detail or "ok"),
+                "provider_mode": mode_info.get("provider_mode", "local_vipdoc"),
+                "cache_dir": mode_info.get("cache_dir", ""),
+                "has_vipdoc": bool(mode_info.get("has_vipdoc", True)),
+            }
+        return {
+            "status": "error",
+            "ok": False,
+            "msg": str(detail or provider.last_error or "连通性校验失败"),
+            "stock_code": stock_code,
+            "tdxdir_used": tdxdir,
+            "autodetected": autodetected,
+            "candidates": candidates,
+            "provider_mode": mode_info.get("provider_mode", "local_vipdoc"),
+            "cache_dir": mode_info.get("cache_dir", ""),
+            "has_vipdoc": bool(mode_info.get("has_vipdoc", True)),
+        }
+    except Exception as e:
+        logger.error(f"/api/config/test_tdx_connectivity failed: {e}", exc_info=True)
+        return {"status": "error", "ok": False, "msg": str(e)}
+
+
+@app.get("/api/fundamental/catalog")
+async def api_fundamental_catalog():
+    try:
+        return {"status": "success", "catalog": fundamental_adapter_manager.catalog_with_selection()}
+    except Exception as e:
+        logger.error(f"/api/fundamental/catalog failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e), "catalog": {}}
+
+
+@app.post("/api/fundamental/profile")
+async def api_fundamental_profile(req: FundamentalProfileRequest):
+    try:
+        stock_code = str(req.stock_code or "").strip().upper()
+        if not stock_code:
+            return {"status": "error", "msg": "stock_code is required"}
+        context = str(req.context or "backtest").strip().lower()
+        if context not in {"backtest", "live"}:
+            context = "backtest"
+        profile = await asyncio.to_thread(
+            fundamental_adapter_manager.get_profile,
+            stock_code,
+            context,
+            bool(req.force),
+            bool(req.allow_network),
+        )
+        if isinstance(profile, dict) and str(profile.get("status", "")).strip().lower() == "error":
+            return {
+                "status": "error",
+                "msg": str(profile.get("msg", "fundamental profile failed") or "fundamental profile failed"),
+                "profile": profile,
+            }
+        return {"status": "success", "profile": profile}
+    except Exception as e:
+        logger.error(f"/api/fundamental/profile failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e), "profile": {}}
+
+
+@app.get("/api/fundamental/cache_list")
+async def api_fundamental_cache_list(stock_code: str = "", context: str = "", limit: int = 60):
+    try:
+        data = await asyncio.to_thread(
+            fundamental_adapter_manager.list_disk_cache,
+            stock_code,
+            context,
+            limit,
+        )
+        return {"status": "success", **(data if isinstance(data, dict) else {})}
+    except Exception as e:
+        logger.error(f"/api/fundamental/cache_list failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e), "items": []}
+
+
+@app.get("/api/fundamental/cache_file")
+async def api_fundamental_cache_file(file_name: str):
+    try:
+        if not str(file_name or "").strip():
+            return {"status": "error", "msg": "file_name is required"}
+        data = await asyncio.to_thread(fundamental_adapter_manager.read_disk_cache, file_name)
+        if isinstance(data, dict):
+            return data
+        return {"status": "error", "msg": "unexpected response"}
+    except Exception as e:
+        logger.error(f"/api/fundamental/cache_file failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.get("/api/report/latest")
+async def api_latest_report():
+    try:
+        load_report_history()
+        ranking = []
+        summary = None
+        strategy_reports = {}
+        first = {}
+        if report_history and isinstance(report_history, list):
+            first = report_history[0] if report_history else {}
+            if isinstance(first, dict):
+                summary = first.get("summary")
+                strategy_reports = first.get("strategy_reports") or {}
+        if (not isinstance(summary, dict)) and isinstance(latest_backtest_result, dict):
+            summary = latest_backtest_result
+            strategy_reports = latest_strategy_reports or {}
+        if not isinstance(summary, dict):
+            summary = None
+        if summary:
+            ranking = summary.get("ranking", [])
+        if not isinstance(strategy_reports, dict):
+            strategy_reports = {}
+        reports = [v for v in strategy_reports.values() if isinstance(v, dict)]
+        reports = sorted(reports, key=lambda x: str(x.get("strategy_id", "")))
+        payload = {
+            "report_id": first.get("report_id") if isinstance(first, dict) else None,
+            "status": first.get("status") if isinstance(first, dict) else None,
+            "error_msg": first.get("error_msg") if isinstance(first, dict) else None,
+            "summary": summary,
+            "ranking": ranking if isinstance(ranking, list) else [],
+            "strategy_reports": reports,
+            "fundamental_profile": first.get("fundamental_profile") if isinstance(first, dict) and isinstance(first.get("fundamental_profile"), dict) else {},
+            "consistency_summary": _build_report_consistency_summary(first if isinstance(first, dict) else {}),
+            **_build_ai_review_payload(first if isinstance(first, dict) else {}, first.get("report_id") if isinstance(first, dict) else ""),
+            **_build_buffett_review_payload(first if isinstance(first, dict) else {}, first.get("report_id") if isinstance(first, dict) else ""),
+        }
+        payload = _sanitize_non_finite(payload)
+        safe_payload = _safe_json_obj(payload)
+        if isinstance(safe_payload, dict):
+            return safe_payload
+        return {
+            "summary": None,
+            "ranking": [],
+            "strategy_reports": []
+        }
+    except Exception as e:
+        logger.error(f"/api/report/latest failed: {e}", exc_info=True)
+        return {"summary": None, "ranking": [], "strategy_reports": []}
+
+@app.get("/api/report/history")
+async def api_report_history():
+    try:
+        load_report_history()
+        items = []
+        for r in report_history if isinstance(report_history, list) else []:
+            if not isinstance(r, dict):
+                continue
+            summary = r.get("summary") if isinstance(r.get("summary"), dict) else {}
+            items.append({
+                "report_id": r.get("report_id"),
+                "created_at": r.get("created_at"),
+                "finished_at": r.get("finished_at"),
+                "status": r.get("status", "success" if r.get("summary") else "failed"),
+                "error_msg": r.get("error_msg"),
+                "stock_code": r.get("stock_code") or summary.get("stock"),
+                "period": summary.get("period"),
+                "total_trades": summary.get("total_trades", 0),
+                "fundamental_status": (
+                    str((r.get("fundamental_profile") or {}).get("status", "")).strip()
+                    if isinstance(r.get("fundamental_profile"), dict) else ""
+                )
+            })
+        return {"reports": items}
+    except Exception as e:
+        logger.error(f"/api/report/history failed: {e}", exc_info=True)
+        return {"reports": []}
+
+@app.get("/api/report/{report_id}")
+async def api_report_detail(report_id: str):
+    try:
+        rid = str(report_id)
+        cached = report_detail_cache.get(rid)
+        if isinstance(cached, dict):
+            return cached
+        load_report_history()
+        for r in report_history if isinstance(report_history, list) else []:
+            if not isinstance(r, dict):
+                continue
+            if str(r.get("report_id")) == rid:
+                summary = r.get("summary") if isinstance(r.get("summary"), dict) else None
+                ranking = summary.get("ranking", []) if summary else []
+                strategy_reports = r.get("strategy_reports") if isinstance(r.get("strategy_reports"), dict) else {}
+                reports = [v for v in strategy_reports.values() if isinstance(v, dict)]
+                reports = sorted(reports, key=lambda x: str(x.get("strategy_id", "")))
+                payload = {
+                    "report_id": r.get("report_id"),
+                    "created_at": r.get("created_at"),
+                    "finished_at": r.get("finished_at"),
+                    "status": r.get("status", "success" if summary else "failed"),
+                    "error_msg": r.get("error_msg"),
+                    "request": r.get("request") if isinstance(r.get("request"), dict) else {},
+                    "summary": summary,
+                    "ranking": ranking,
+                    "strategy_reports": reports,
+                    "fundamental_profile": r.get("fundamental_profile") if isinstance(r.get("fundamental_profile"), dict) else {},
+                    "consistency_summary": _build_report_consistency_summary(r),
+                    **_build_ai_review_payload(r, report_id),
+                    **_build_buffett_review_payload(r, report_id),
+                }
+                payload = _sanitize_non_finite(payload)
+                safe_payload = _safe_json_obj(payload)
+                if isinstance(safe_payload, dict):
+                    report_detail_cache[rid] = safe_payload
+                    if len(report_detail_cache) > 300:
+                        first_key = next(iter(report_detail_cache))
+                        if first_key != rid:
+                            report_detail_cache.pop(first_key, None)
+                    return safe_payload
+                return {"summary": None, "ranking": [], "strategy_reports": []}
+        raise HTTPException(status_code=404, detail="report not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"/api/report/{report_id} failed: {e}", exc_info=True)
+        return {"summary": None, "ranking": [], "strategy_reports": []}
+
+
+@app.get("/api/consistency/snapshots")
+async def api_consistency_snapshots(
+    market: str = "",
+    code: str = "",
+    strategy_id: str = "",
+    strategy_ids: Optional[List[str]] = None,
+    timeframe: str = "",
+    timeframes: Optional[List[str]] = None,
+    start_date: str = "",
+    end_date: str = "",
+    page: int = 1,
+    page_size: int = 20,
+):
+    try:
+        payload = consistency_snapshot_store.list_snapshots(
+            market=market,
+            code=code,
+            strategy_id=strategy_id,
+            strategy_ids=strategy_ids,
+            timeframe=timeframe,
+            timeframes=timeframes,
+            start_date=start_date,
+            end_date=end_date,
+            page=page,
+            page_size=page_size,
+        )
+        return {"status": "success", **payload}
+    except Exception as e:
+        logger.error("/api/consistency/snapshots failed: %s", e, exc_info=True)
+        return {"status": "error", "msg": str(e), "items": [], "total": 0, "page": page, "page_size": page_size}
+
+
+@app.get("/api/consistency/snapshots/{snapshot_id}")
+async def api_consistency_snapshot_detail(snapshot_id: str, include_rows: bool = True):
+    try:
+        payload = consistency_snapshot_store.get_snapshot(snapshot_id, include_rows=bool(include_rows))
+        if not isinstance(payload, dict) or not payload:
+            raise HTTPException(status_code=404, detail="snapshot not found")
+        return {"status": "success", **payload}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("/api/consistency/snapshots/%s failed: %s", snapshot_id, e, exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.get("/api/consistency/replay_runs")
+async def api_consistency_replay_runs(
+    market: str = "",
+    code: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    page: int = 1,
+    page_size: int = 20,
+):
+    try:
+        payload = consistency_replay_store.list_replay_runs(
+            market=market,
+            code=code,
+            start_date=start_date,
+            end_date=end_date,
+            page=page,
+            page_size=page_size,
+        )
+        return {"status": "success", **payload}
+    except Exception as e:
+        logger.error("/api/consistency/replay_runs failed: %s", e, exc_info=True)
+        return {"status": "error", "msg": str(e), "items": [], "total": 0, "page": page, "page_size": page_size}
+
+
+@app.get("/api/consistency/replay_runs/{run_id}")
+async def api_consistency_replay_run_detail(run_id: str):
+    try:
+        payload = consistency_replay_store.get_replay_run(run_id)
+        if not isinstance(payload, dict) or not payload:
+            raise HTTPException(status_code=404, detail="replay run not found")
+        return {"status": "success", **payload}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("/api/consistency/replay_runs/%s failed: %s", run_id, e, exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.post("/api/consistency/replay_runs")
+async def api_consistency_replay_run(req: ConsistencyReplayRequest):
+    try:
+        market = str(req.market or "ashare").strip().lower() or "ashare"
+        code = str(req.code or "").strip().upper()
+        start_date = str(req.start_date or "").strip()
+        end_date = str(req.end_date or "").strip()
+        if not code or not start_date or not end_date:
+            return {"status": "error", "msg": "code/start_date/end_date are required"}
+        replay_request = consistency_replay_builder.build_replay_request_from_filters(
+            market=market,
+            code=code,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        snapshot_ids = replay_request.get("snapshot_ids", []) if isinstance(replay_request, dict) else []
+        if not snapshot_ids:
+            return {"status": "error", "msg": "指定区间无可用实盘快照"}
+        report_id = start_new_backtest_report(
+            code,
+            "all",
+            request_payload={
+                "mode": "consistency_replay",
+                "market": market,
+                "code": code,
+                "start_date": start_date,
+                "end_date": end_date,
+                "snapshot_ids": snapshot_ids,
+                "segment_count": int(replay_request.get("segment_count", 0) or 0),
+            },
+        )
+        replay_manifest = consistency_replay_store.save_replay_run(
+            market=market,
+            code=code,
+            start_date=start_date,
+            end_date=end_date,
+            snapshot_ids=snapshot_ids,
+            status="running",
+        )
+        try:
+            await run_backtest_task(
+                stock_code=code,
+                strategy_id="all",
+                strategy_mode=None,
+                start=start_date,
+                end=end_date,
+                capital=req.capital,
+                strategy_ids=replay_request.get("strategy_ids") or None,
+                combination_config=None,
+                report_id=report_id,
+                realtime_push=bool(req.realtime_push),
+                provider_override=replay_request.get("provider"),
+                provider_source_override="consistency_snapshot",
+            )
+            detail = consistency_replay_store.get_replay_run(replay_manifest.get("replay_run_id", ""))
+            current_report = current_backtest_report if isinstance(current_backtest_report, dict) else {}
+            backtest_result = _build_replay_backtest_result(current_report)
+            consistency_replay_store.update_replay_run(
+                replay_manifest.get("replay_run_id", ""),
+                status=str(current_report.get("status", "success") or "success"),
+                error_msg=str(current_report.get("error_msg", "") or ""),
+                backtest_result=backtest_result,
+            )
+            snapshot_detail = _build_consistency_snapshot_detail(replay_request)
+            report_payload = {}
+            if isinstance(snapshot_detail, dict) and snapshot_detail:
+                report_payload = consistency_report_builder.build_report(
+                    market=market,
+                    code=code,
+                    snapshot_id=str(snapshot_ids[0] if snapshot_ids else ""),
+                    replay_run_id=str(replay_manifest.get("replay_run_id", "") or ""),
+                    snapshot_detail=snapshot_detail,
+                    replay_result=backtest_result,
+                )
+                report_payload = consistency_report_store.save_report(report_payload)
+            return {
+                "status": "success",
+                "replay_run_id": replay_manifest.get("replay_run_id"),
+                "report_id": report_id,
+                "consistency_report_id": report_payload.get("report_id") if isinstance(report_payload, dict) else None,
+                "snapshot_ids": snapshot_ids,
+                "segment_count": replay_request.get("segment_count", 0),
+            }
+        except Exception as e:
+            consistency_replay_store.update_replay_run(replay_manifest.get("replay_run_id", ""), status="failed", error_msg=str(e))
+            raise
+    except Exception as e:
+        logger.error("/api/consistency/replay_runs POST failed: %s", e, exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.post("/api/consistency/compare")
+async def api_consistency_compare(req: ConsistencyCompareRequest):
+    try:
+        market = str(req.market or "ashare").strip().lower() or "ashare"
+        code = str(req.code or "").strip().upper()
+        start_date = str(req.start_date or "").strip()
+        end_date = str(req.end_date or "").strip()
+        strategy_ids = _normalize_text_list(req.strategy_ids)
+        timeframes = _normalize_text_list(req.timeframes)
+        snapshot_selection_mode = str(req.snapshot_selection_mode or "auto").strip().lower() or "auto"
+        backtest_source_type = str(req.backtest_source_type or "").strip().lower()
+        selected_report_id = str(req.selected_report_id or "").strip()
+        note_text = str(req.note or "").strip()
+        if not code or not start_date or not end_date:
+            return {"status": "error", "msg": "code/start_date/end_date are required"}
+        if backtest_source_type not in {"existing_report", "new_backtest"}:
+            return {"status": "error", "msg": "backtest_source_type must be existing_report or new_backtest"}
+        if snapshot_selection_mode == "manual":
+            selected_snapshot_ids = _normalize_text_list(req.selected_snapshot_ids)
+            if not selected_snapshot_ids:
+                return {"status": "error", "msg": "请先选择参与对比的实盘记录"}
+            replay_request = consistency_replay_builder.build_replay_request_from_snapshot_ids(
+                market=market,
+                code=code,
+                start_date=start_date,
+                end_date=end_date,
+                snapshot_ids=selected_snapshot_ids,
+                strategy_ids=strategy_ids,
+                timeframes=timeframes,
+            )
+        else:
+            replay_request = consistency_replay_builder.build_replay_request_from_filters(
+                market=market,
+                code=code,
+                start_date=start_date,
+                end_date=end_date,
+                strategy_ids=strategy_ids,
+                timeframes=timeframes,
+            )
+        snapshot_ids = replay_request.get("snapshot_ids", []) if isinstance(replay_request, dict) else []
+        snapshot_detail = _build_consistency_snapshot_detail(replay_request)
+        if not snapshot_ids or not snapshot_detail:
+            return {"status": "error", "msg": "指定条件下无可用实盘快照"}
+        scope_error = _validate_compare_strategy_scope(strategy_ids, (snapshot_detail.get("meta", {}) or {}).get("strategy_ids"))
+        if scope_error:
+            return {"status": "error", "msg": scope_error}
+        replay_run_id = ""
+        report_id = ""
+        if backtest_source_type == "existing_report":
+            if not selected_report_id:
+                return {"status": "error", "msg": "请先选择已有回测任务"}
+            backtest_result = consistency_backtest_report_adapter.adapt_report(selected_report_id, strategy_ids=strategy_ids)
+            if not backtest_result:
+                return {"status": "error", "msg": "所选回测任务不存在，或与当前策略筛选不匹配"}
+            replay_manifest = consistency_replay_store.save_replay_run(
+                market=market,
+                code=code,
+                start_date=start_date,
+                end_date=end_date,
+                snapshot_ids=snapshot_ids,
+                backtest_result=backtest_result,
+                status=str(backtest_result.get("status", "success") or "success"),
+            )
+            replay_run_id = str(replay_manifest.get("replay_run_id", "") or "")
+            report_id = str(backtest_result.get("report_id", "") or selected_report_id)
+        else:
+            nb = req.new_backtest_request or ConsistencyNewBacktestRequest()
+            new_strategy_ids = _normalize_text_list(nb.strategy_ids) or strategy_ids or _normalize_text_list(replay_request.get("strategy_ids"))
+            if strategy_ids:
+                missing = [sid for sid in strategy_ids if sid not in new_strategy_ids]
+                if missing:
+                    new_strategy_ids.extend(missing)
+            scope_error = _validate_compare_strategy_scope(new_strategy_ids, (snapshot_detail.get("meta", {}) or {}).get("strategy_ids"))
+            if scope_error:
+                return {"status": "error", "msg": scope_error}
+            report_id = start_new_backtest_report(
+                code,
+                "all",
+                request_payload={
+                    "mode": "consistency_compare",
+                    "market": market,
+                    "code": code,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "snapshot_ids": snapshot_ids,
+                    "segment_count": int(replay_request.get("segment_count", 0) or 0),
+                    "backtest_source_type": backtest_source_type,
+                    "selected_strategy_ids": new_strategy_ids,
+                },
+            )
+            replay_manifest = consistency_replay_store.save_replay_run(
+                market=market,
+                code=code,
+                start_date=start_date,
+                end_date=end_date,
+                snapshot_ids=snapshot_ids,
+                status="running",
+            )
+            replay_run_id = str(replay_manifest.get("replay_run_id", "") or "")
+            try:
+                await run_backtest_task(
+                    stock_code=code,
+                    strategy_id="all",
+                    strategy_mode=nb.strategy_mode,
+                    start=start_date,
+                    end=end_date,
+                    capital=nb.capital,
+                    strategy_ids=new_strategy_ids or None,
+                    combination_config=nb.combination_config,
+                    report_id=report_id,
+                    realtime_push=bool(nb.realtime_push),
+                    provider_override=replay_request.get("provider"),
+                    provider_source_override="consistency_snapshot",
+                )
+                current_report = current_backtest_report if isinstance(current_backtest_report, dict) else {}
+                backtest_result = _build_replay_backtest_result(current_report)
+                consistency_replay_store.update_replay_run(
+                    replay_run_id,
+                    status=str(current_report.get("status", "success") or "success"),
+                    error_msg=str(current_report.get("error_msg", "") or ""),
+                    backtest_result=backtest_result,
+                )
+            except Exception as e:
+                consistency_replay_store.update_replay_run(replay_run_id, status="failed", error_msg=str(e))
+                raise
+        comparison_scope_summary = _sanitize_compare_scope_summary(
+            code=code,
+            start_date=start_date,
+            end_date=end_date,
+            strategy_ids=strategy_ids or replay_request.get("strategy_ids"),
+            timeframes=timeframes,
+            snapshot_ids=snapshot_ids,
+        )
+        report_payload = _build_consistency_report_payload(
+            market=market,
+            code=code,
+            replay_run_id=replay_run_id,
+            snapshot_ids=snapshot_ids,
+            snapshot_detail=snapshot_detail,
+            replay_result=backtest_result,
+            backtest_source_type=backtest_source_type,
+            selected_report_id=report_id if backtest_source_type == "existing_report" else selected_report_id,
+            linked_report_id=report_id,
+            selected_strategy_ids=strategy_ids or replay_request.get("strategy_ids"),
+            comparison_scope_summary=comparison_scope_summary,
+            note=note_text,
+        )
+        report_payload = consistency_report_store.save_report(report_payload)
+        return {
+            "status": "success",
+            "replay_run_id": replay_run_id,
+            "report_id": report_id,
+            "consistency_report_id": report_payload.get("report_id"),
+            "snapshot_ids": snapshot_ids,
+            "segment_count": replay_request.get("segment_count", 0),
+            "comparison_scope_summary": comparison_scope_summary,
+        }
+    except Exception as e:
+        logger.error("/api/consistency/compare POST failed: %s", e, exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.get("/api/consistency/reports")
+async def api_consistency_reports(market: str = "", code: str = "", page: int = 1, page_size: int = 20):
+    try:
+        payload = consistency_report_store.list_reports(market=market, code=code, page=page, page_size=page_size)
+        return {"status": "success", **payload}
+    except Exception as e:
+        logger.error("/api/consistency/reports failed: %s", e, exc_info=True)
+        return {"status": "error", "msg": str(e), "items": [], "total": 0, "page": page, "page_size": page_size}
+
+
+@app.get("/api/consistency/reports/{report_id}")
+async def api_consistency_report_detail(report_id: str):
+    try:
+        payload = consistency_report_store.get_report(report_id)
+        if not isinstance(payload, dict) or not payload:
+            raise HTTPException(status_code=404, detail="consistency report not found")
+        return {"status": "success", **payload}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("/api/consistency/reports/%s failed: %s", report_id, e, exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+def _build_ai_report_review(report_item):
+    cfg = ConfigLoader.reload()
+    api_key = str(cfg.get("data_provider.llm_api_key", "") or "").strip()
+    base_url = str(cfg.get("data_provider.llm_api_url", "") or "").strip()
+    model_name = str(cfg.get("data_provider.llm_model", "") or "gpt-4o-mini").strip()
+    if not api_key or not base_url:
+        return {"markdown": "", "summary": {}}
+    summary = report_item.get("summary") if isinstance(report_item.get("summary"), dict) else {}
+    strategy_reports = report_item.get("strategy_reports") if isinstance(report_item.get("strategy_reports"), dict) else {}
+    compact_reports = []
+
+    def _trade_nodes(trades, direction, max_items=8):
+        out = []
+        for t in trades:
+            if not isinstance(t, dict):
+                continue
+            if str(t.get("direction", "")).upper() != direction:
+                continue
+            out.append({
+                "dt": t.get("dt"),
+                "price": t.get("price"),
+                "quantity": t.get("quantity"),
+                "reason": t.get("reason"),
+                "pnl": t.get("pnl")
+            })
+            if len(out) >= max_items:
+                break
+        return out
+
+    for sid, rep in strategy_reports.items():
+        if not isinstance(rep, dict):
+            continue
+        trades = rep.get("trade_details") if isinstance(rep.get("trade_details"), list) else []
+        compact_reports.append({
+            "strategy_id": sid,
+            "kline_type": rep.get("kline_type"),
+            "period_label": rep.get("period_label"),
+            "score_total": rep.get("score_total"),
+            "annualized_roi": rep.get("annualized_roi"),
+            "max_dd": rep.get("max_dd"),
+            "win_rate": rep.get("win_rate"),
+            "total_trades": rep.get("total_trades"),
+            "force_close_count": rep.get("force_close_count", 0),
+            "last_trade_reason": trades[-1].get("reason") if trades else None,
+            "buy_nodes": _trade_nodes(trades, "BUY"),
+            "sell_nodes": _trade_nodes(trades, "SELL")
+        })
+    req_payload = {
+        "stock_code": report_item.get("stock_code"),
+        "request": report_item.get("request"),
+        "summary": summary,
+        "strategy_reports": compact_reports
+    }
+    url = base_url.rstrip("/")
+    if not url.endswith("/chat/completions"):
+        if url.endswith("/v1"):
+            url = f"{url}/chat/completions"
+        else:
+            url = f"{url}/v1/chat/completions"
+    system_prompt = "你是A股量化复盘分析师，请根据回测摘要与交易明细给出结构化复盘，必须具体到交易节点与参数值。"
+    user_prompt = (
+        "请先输出一个JSON对象，再输出一行 --- 分隔线，最后输出简洁Markdown。\n"
+        "JSON结构固定：\n"
+        "{\n"
+        "  \"title\": \"一句话结论\",\n"
+        "  \"verdict\": \"positive|neutral|negative\",\n"
+        "  \"score\": 0-100,\n"
+        "  \"highlights\": [\"关键问题1\", \"关键问题2\"],\n"
+        "  \"risks\": [\"风险1\", \"风险2\"],\n"
+        "  \"buy_points\": [{\"dt\": \"时间\", \"reason\": \"原因\", \"signal_logic\": \"逻辑\"}],\n"
+        "  \"sell_points\": [{\"dt\": \"时间\", \"reason\": \"原因\", \"signal_logic\": \"逻辑\"}],\n"
+        "  \"parameter_suggestions\": [{\"name\": \"参数名\", \"suggested\": \"建议值\", \"why\": \"原因\"}],\n"
+        "  \"next_experiments\": [{\"label\": \"A\", \"params\": {\"参数\": \"值\"}, \"expectation\": \"预期\"}]\n"
+        "}\n"
+        "Markdown必须严格包含六段：\n"
+        "1) 核心结论\n"
+        "2) 关键问题\n"
+        "3) 基于交易明细的硅基节点分析（逐条说明硅基核心依据、信号逻辑、触发原因）\n"
+        "4) 基于交易明细的流码节点分析（逐条说明流码核心依据、信号逻辑、触发原因）\n"
+        "5) 参数优化建议（必须给出明确参数值，不要只给方向）\n"
+        "6) 下一轮实验方案（A/B至少两组，直接列出参数值对比）\n\n"
+        "注意：如果某段缺少交易节点，请写“本周期无该类交易节点”。\n"
+        f"回测数据：\n{json.dumps(req_payload, ensure_ascii=False)}"
+    )
+    payload = {
+        "model": model_name,
+        "temperature": 0.2,
+        "max_tokens": 1400,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+    }
+    try:
+        req = urllib.request.Request(
+            url=url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            raw = resp.read().decode("utf-8")
+        obj = json.loads(raw)
+        content = str(obj.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+        parsed, markdown = _split_llm_json_and_markdown(content)
+        normalized = _normalize_ai_review_summary({**parsed, "source": "llm_json"} if isinstance(parsed, dict) else {})
+        if not markdown:
+            markdown = content
+        if not normalized.get("title") and markdown:
+            normalized = _parse_ai_review_summary_from_markdown(markdown)
+        return {"markdown": str(markdown or "").strip(), "summary": normalized if isinstance(normalized, dict) else {}}
+    except Exception as e:
+        logger.error(f"ai_review llm call failed url={url} model={model_name} err={e}", exc_info=True)
+        return {"markdown": "", "summary": {}}
+
+
+def _build_ai_report_review_buffett(report_item):
+    cfg = ConfigLoader.reload()
+    api_key = str(cfg.get("data_provider.llm_api_key", "") or "").strip()
+    base_url = str(cfg.get("data_provider.llm_api_url", "") or "").strip()
+    model_name = str(cfg.get("data_provider.llm_model", "") or "gpt-4o-mini").strip()
+    if not api_key or not base_url:
+        return {"markdown": "", "summary": {}}
+    summary = report_item.get("summary") if isinstance(report_item.get("summary"), dict) else {}
+    strategy_reports = report_item.get("strategy_reports") if isinstance(report_item.get("strategy_reports"), dict) else {}
+    compact_reports = []
+
+    def _trade_nodes(trades, direction, max_items=8):
+        out = []
+        for t in trades:
+            if not isinstance(t, dict):
+                continue
+            if str(t.get("direction", "")).upper() != direction:
+                continue
+            out.append({
+                "dt": t.get("dt"),
+                "price": t.get("price"),
+                "quantity": t.get("quantity"),
+                "reason": t.get("reason"),
+                "pnl": t.get("pnl")
+            })
+            if len(out) >= max_items:
+                break
+        return out
+
+    for sid, rep in strategy_reports.items():
+        if not isinstance(rep, dict):
+            continue
+        trades = rep.get("trade_details") if isinstance(rep.get("trade_details"), list) else []
+        compact_reports.append({
+            "strategy_id": sid,
+            "kline_type": rep.get("kline_type"),
+            "period_label": rep.get("period_label"),
+            "score_total": rep.get("score_total"),
+            "annualized_roi": rep.get("annualized_roi"),
+            "max_dd": rep.get("max_dd"),
+            "win_rate": rep.get("win_rate"),
+            "total_trades": rep.get("total_trades"),
+            "force_close_count": rep.get("force_close_count", 0),
+            "last_trade_reason": trades[-1].get("reason") if trades else None,
+            "buy_nodes": _trade_nodes(trades, "BUY"),
+            "sell_nodes": _trade_nodes(trades, "SELL")
+        })
+    req_payload = {
+        "stock_code": report_item.get("stock_code"),
+        "request": report_item.get("request"),
+        "summary": summary,
+        "strategy_reports": compact_reports
+    }
+    url = base_url.rstrip("/")
+    if not url.endswith("/chat/completions"):
+        if url.endswith("/v1"):
+            url = f"{url}/chat/completions"
+        else:
+            url = f"{url}/v1/chat/completions"
+    system_prompt = "你是巴菲特风格的A股回测复盘顾问。仅基于给定回测报告做投资风格点评，禁止给出自动下单或实盘执行指令。"
+    user_prompt = (
+        "请先输出一个JSON对象，再输出一行 --- 分隔线，最后输出简洁Markdown。\n"
+        "JSON结构固定：\n"
+        "{\n"
+        "  \"title\": \"一句话结论\",\n"
+        "  \"verdict\": \"BUY|WATCH|HOLD|AVOID\",\n"
+        "  \"circle_of_competence\": \"IN|BOUNDARY|OUT|N/A\",\n"
+        "  \"key_assumptions\": [\"假设1\"],\n"
+        "  \"quality_assessment\": [\"评估1\"],\n"
+        "  \"margin_of_safety\": [\"评估1\"],\n"
+        "  \"sell_checklist\": [{\"key\": \"drawdown_break\", \"status\": \"pass|warn|fail|na\", \"note\": \"说明\"}],\n"
+        "  \"top_risks\": [\"风险1\"],\n"
+        "  \"monitoring_metrics\": [\"指标1\"],\n"
+        "  \"final_note\": \"仅分析，不执行交易\"\n"
+        "}\n"
+        "Markdown必须严格包含以下九段：\n"
+        "1) 结论（BUY/WATCH/HOLD/AVOID + 一句话理由）\n"
+        "2) 能力圈判断（IN/BOUNDARY/OUT）\n"
+        "3) 关键假设（3-5条）\n"
+        "4) 业务质量代理评估（用收益稳定性、回撤控制、策略一致性）\n"
+        "5) 安全边际代理评估（用风险收益比、回撤缓冲）\n"
+        "6) 流码标准检查（drawdown_break、win_rate_decay、ranking_drop、rule_stability）\n"
+        "7) 三大风险\n"
+        "8) 监控指标（季度/每轮回测跟踪项）\n"
+        "9) 最终结论（必须明确：仅分析，不执行交易）\n\n"
+        "注意：\n"
+        "- 缺失字段必须写 N/A，不得编造基本面数据。\n"
+        "- 不得输出硅基流码指令、仓位执行指令或券商操作步骤。\n"
+        f"回测数据：\n{json.dumps(req_payload, ensure_ascii=False)}"
+    )
+    payload = {
+        "model": model_name,
+        "temperature": 0.2,
+        "max_tokens": 1600,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+    }
+    try:
+        req = urllib.request.Request(
+            url=url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            raw = resp.read().decode("utf-8")
+        obj = json.loads(raw)
+        content = str(obj.get("choices", [{}])[0].get("message", {}).get("content", "")).strip()
+        parsed, markdown = _split_llm_json_and_markdown(content)
+        normalized = _normalize_buffett_review_summary({**parsed, "source": "llm_json"} if isinstance(parsed, dict) else {})
+        if not markdown:
+            markdown = content
+        if not normalized.get("title") and markdown:
+            normalized = _parse_buffett_review_summary_from_markdown(markdown)
+        return {"markdown": str(markdown or "").strip(), "summary": normalized if isinstance(normalized, dict) else {}}
+    except Exception as e:
+        logger.error(f"buffett_ai_review llm call failed url={url} model={model_name} err={e}", exc_info=True)
+        return {"markdown": "", "summary": {}}
+
+
+@app.post("/api/report/{report_id}/ai_review")
+async def api_report_ai_review(report_id: str, force: bool = False):
+    try:
+        load_report_history()
+        for idx, r in enumerate(report_history if isinstance(report_history, list) else []):
+            if not isinstance(r, dict):
+                continue
+            if str(r.get("report_id")) != str(report_id):
+                continue
+            rid = str(report_id)
+            if not force:
+                cached = str(report_ai_review_cache.get(rid, "") or "").strip()
+                cached_ver = int(report_ai_review_cache.get(f"{rid}__v", 0) or 0)
+                cached_summary = report_ai_review_cache.get(f"{rid}__summary")
+                if cached and cached_ver == AI_REVIEW_SCHEMA_VERSION:
+                    return {"status": "success", "report_id": report_id, "analysis": cached, "analysis_summary": cached_summary if isinstance(cached_summary, dict) else {}, "cached": True}
+                cached = str(r.get("ai_review_text", "") or "").strip()
+                persisted_ver = int(r.get("ai_review_version", 0) or 0)
+                if cached and persisted_ver == AI_REVIEW_SCHEMA_VERSION:
+                    report_ai_review_cache[rid] = cached
+                    report_ai_review_cache[f"{rid}__v"] = AI_REVIEW_SCHEMA_VERSION
+                    report_ai_review_cache[f"{rid}__summary"] = r.get("ai_review_summary") if isinstance(r.get("ai_review_summary"), dict) else {}
+                    report_ai_review_cache[f"{rid}__summary_v"] = int(r.get("ai_review_summary_version", 0) or 0)
+                    return {"status": "success", "report_id": report_id, "analysis": cached, "analysis_summary": report_ai_review_cache.get(f"{rid}__summary") if isinstance(report_ai_review_cache.get(f"{rid}__summary"), dict) else {}, "cached": True}
+            cfg = ConfigLoader.reload()
+            missing = []
+            if not str(cfg.get("data_provider.llm_api_url", "") or "").strip():
+                missing.append("llm_api_url")
+            if not str(cfg.get("data_provider.llm_api_key", "") or "").strip():
+                missing.append("llm_api_key")
+            if missing:
+                return {"status": "error", "msg": f"AI复盘未配置：请先在配置中填写 {', '.join(missing)}"}
+            bundle = _build_ai_report_review(r)
+            analysis = str((bundle or {}).get("markdown", "") or "").strip()
+            analysis_summary = (bundle or {}).get("summary") if isinstance((bundle or {}).get("summary"), dict) else {}
+            if not analysis:
+                return {"status": "error", "msg": "AI复盘生成失败：模型调用超时、鉴权失败或返回空内容，请检查模型配置与服务日志"}
+            report_history[idx]["ai_review_text"] = analysis
+            report_history[idx]["ai_review_version"] = AI_REVIEW_SCHEMA_VERSION
+            report_history[idx]["ai_review_summary"] = analysis_summary
+            report_history[idx]["ai_review_summary_version"] = AI_REVIEW_SUMMARY_SCHEMA_VERSION if analysis_summary else 0
+            report_ai_review_cache[rid] = analysis
+            report_ai_review_cache[f"{rid}__v"] = AI_REVIEW_SCHEMA_VERSION
+            report_ai_review_cache[f"{rid}__summary"] = analysis_summary
+            report_ai_review_cache[f"{rid}__summary_v"] = AI_REVIEW_SUMMARY_SCHEMA_VERSION if analysis_summary else 0
+            persist_report_history()
+            return {"status": "success", "report_id": report_id, "analysis": analysis, "analysis_summary": analysis_summary, "cached": False}
+        return {"status": "error", "msg": "report not found"}
+    except Exception as e:
+        logger.error(f"/api/report/{report_id}/ai_review failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.post("/api/report/{report_id}/ai_review_buffett")
+async def api_report_ai_review_buffett(report_id: str, force: bool = False):
+    try:
+        load_report_history()
+        for idx, r in enumerate(report_history if isinstance(report_history, list) else []):
+            if not isinstance(r, dict):
+                continue
+            if str(r.get("report_id")) != str(report_id):
+                continue
+            rid = str(report_id)
+            if not force:
+                cached = str(report_buffett_review_cache.get(rid, "") or "").strip()
+                cached_ver = int(report_buffett_review_cache.get(f"{rid}__v", 0) or 0)
+                cached_summary = report_buffett_review_cache.get(f"{rid}__summary")
+                if cached and cached_ver == BUFFETT_REVIEW_SCHEMA_VERSION:
+                    return {"status": "success", "report_id": report_id, "analysis": cached, "analysis_summary": cached_summary if isinstance(cached_summary, dict) else {}, "cached": True}
+                cached = str(r.get("buffett_review_text", "") or "").strip()
+                persisted_ver = int(r.get("buffett_review_version", 0) or 0)
+                if cached and persisted_ver == BUFFETT_REVIEW_SCHEMA_VERSION:
+                    report_buffett_review_cache[rid] = cached
+                    report_buffett_review_cache[f"{rid}__v"] = BUFFETT_REVIEW_SCHEMA_VERSION
+                    report_buffett_review_cache[f"{rid}__summary"] = r.get("buffett_review_summary") if isinstance(r.get("buffett_review_summary"), dict) else {}
+                    report_buffett_review_cache[f"{rid}__summary_v"] = int(r.get("buffett_review_summary_version", 0) or 0)
+                    return {"status": "success", "report_id": report_id, "analysis": cached, "analysis_summary": report_buffett_review_cache.get(f"{rid}__summary") if isinstance(report_buffett_review_cache.get(f"{rid}__summary"), dict) else {}, "cached": True}
+            cfg = ConfigLoader.reload()
+            missing = []
+            if not str(cfg.get("data_provider.llm_api_url", "") or "").strip():
+                missing.append("llm_api_url")
+            if not str(cfg.get("data_provider.llm_api_key", "") or "").strip():
+                missing.append("llm_api_key")
+            if missing:
+                return {"status": "error", "msg": f"Buffett复盘未配置：请先在配置中填写 {', '.join(missing)}"}
+            bundle = _build_ai_report_review_buffett(r)
+            analysis = str((bundle or {}).get("markdown", "") or "").strip()
+            analysis_summary = (bundle or {}).get("summary") if isinstance((bundle or {}).get("summary"), dict) else {}
+            if not analysis:
+                return {"status": "error", "msg": "Buffett复盘生成失败：模型调用超时、鉴权失败或返回空内容，请检查模型配置与服务日志"}
+            report_history[idx]["buffett_review_text"] = analysis
+            report_history[idx]["buffett_review_version"] = BUFFETT_REVIEW_SCHEMA_VERSION
+            report_history[idx]["buffett_review_summary"] = analysis_summary
+            report_history[idx]["buffett_review_summary_version"] = BUFFETT_REVIEW_SUMMARY_SCHEMA_VERSION if analysis_summary else 0
+            report_buffett_review_cache[rid] = analysis
+            report_buffett_review_cache[f"{rid}__v"] = BUFFETT_REVIEW_SCHEMA_VERSION
+            report_buffett_review_cache[f"{rid}__summary"] = analysis_summary
+            report_buffett_review_cache[f"{rid}__summary_v"] = BUFFETT_REVIEW_SUMMARY_SCHEMA_VERSION if analysis_summary else 0
+            persist_report_history()
+            return {"status": "success", "report_id": report_id, "analysis": analysis, "analysis_summary": analysis_summary, "cached": False}
+        return {"status": "error", "msg": "report not found"}
+    except Exception as e:
+        logger.error(f"/api/report/{report_id}/ai_review_buffett failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.get("/api/report/strategy/kline_data")
+async def api_report_strategy_kline_data(report_id: str, strategy_id: str):
+    try:
+        cache_key = f"{str(report_id)}|{str(strategy_id)}"
+        cached_payload = report_strategy_kline_cache.get(cache_key)
+        if isinstance(cached_payload, dict):
+            return cached_payload
+        load_report_history()
+        target_report = None
+        for r in report_history if isinstance(report_history, list) else []:
+            if isinstance(r, dict) and str(r.get("report_id")) == str(report_id):
+                target_report = r
+                break
+        if not isinstance(target_report, dict):
+            return {"status": "error", "msg": "report not found"}
+        strategy_reports = target_report.get("strategy_reports") if isinstance(target_report.get("strategy_reports"), dict) else {}
+        srep = strategy_reports.get(str(strategy_id))
+        if not isinstance(srep, dict):
+            return {"status": "error", "msg": "strategy report not found"}
+        summary = target_report.get("summary") if isinstance(target_report.get("summary"), dict) else {}
+        stock_code = _normalize_symbol(target_report.get("stock_code") or summary.get("stock") or "")
+        if not stock_code:
+            return {"status": "error", "msg": "missing stock code"}
+        start_text = str(srep.get("start_date") or "").strip()
+        end_text = str(srep.get("end_date") or "").strip()
+        if not start_text or not end_text:
+            return {"status": "error", "msg": "missing strategy period"}
+        start_dt = pd.to_datetime(start_text)
+        end_dt = pd.to_datetime(end_text)
+        if pd.isna(start_dt) or pd.isna(end_dt):
+            return {"status": "error", "msg": "invalid strategy period"}
+        period_label = _strategy_period_label(strategy_id, srep=srep)
+        interval = _period_label_to_interval(period_label)
+        provider = _select_provider()
+        if hasattr(provider, "fetch_kline_data"):
+            df = await asyncio.to_thread(provider.fetch_kline_data, stock_code, start_dt, end_dt, interval)
+        else:
+            df = pd.DataFrame()
+        if df is None or df.empty:
+            return {"status": "error", "msg": "no kline data"}
+        if "dt" not in df.columns:
+            return {"status": "error", "msg": "missing dt"}
+        if "vol" not in df.columns and "volume" in df.columns:
+            df["vol"] = df["volume"]
+        if "volume" not in df.columns and "vol" in df.columns:
+            df["volume"] = df["vol"]
+        for c in ["open", "high", "low", "close", "volume"]:
+            if c not in df.columns:
+                return {"status": "error", "msg": f"missing {c}"}
+        df["dt"] = pd.to_datetime(df["dt"])
+        df = df.dropna(subset=["dt"]).sort_values("dt")
+        candles = []
+        volumes = []
+        candle_keys = set()
+        for _, row in df.iterrows():
+            ts = int(pd.Timestamp(row["dt"]).timestamp())
+            candle_keys.add(ts)
+            o = float(row["open"])
+            c = float(row["close"])
+            candles.append({
+                "time": ts,
+                "open": o,
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": c
+            })
+            volumes.append({
+                "time": ts,
+                "value": float(row["volume"]),
+                "color": "#ef4444" if c >= o else "#22c55e"
+            })
+        trade_rows = srep.get("trade_details") if isinstance(srep.get("trade_details"), list) else []
+        markers = []
+        for t in trade_rows:
+            if not isinstance(t, dict):
+                continue
+            dt = pd.to_datetime(t.get("dt"))
+            if pd.isna(dt):
+                continue
+            marker_ts = int(pd.Timestamp(dt).timestamp())
+            if interval == "D":
+                marker_ts = int(pd.Timestamp(dt.date()).timestamp())
+            direction = str(t.get("direction", "")).upper()
+            is_buy = direction == "BUY"
+            price_val = float(t.get("price", 0) or 0)
+            markers.append({
+                "time": marker_ts,
+                "position": "belowBar" if is_buy else "aboveBar",
+                "shape": "arrowUp" if is_buy else "arrowDown",
+                "color": "#a855f7" if is_buy else "#06b6d4",
+                "text": f"{'买' if is_buy else '卖'} {price_val:.2f}"
+            })
+        payload = {
+            "status": "success",
+            "stock": stock_code,
+            "interval": interval,
+            "period_label": period_label,
+            "strategy_id": str(strategy_id),
+            "candles": candles,
+            "volumes": volumes,
+            "markers": markers
+        }
+        report_strategy_kline_cache[cache_key] = payload
+        if len(report_strategy_kline_cache) > 300:
+            first_key = next(iter(report_strategy_kline_cache))
+            if first_key != cache_key:
+                report_strategy_kline_cache.pop(first_key, None)
+        return payload
+    except Exception as e:
+        logger.error(f"/api/report/strategy_kline_data failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.post("/api/report/delete")
+async def api_report_delete(req: ReportDeleteRequest):
+    global report_history, latest_backtest_result, latest_strategy_reports, report_strategy_kline_cache, report_ai_review_cache, report_buffett_review_cache, report_detail_cache
+    rid = str(req.report_id or "").strip()
+    if not rid:
+        return {"status": "error", "msg": "report_id is required"}
+    try:
+        load_report_history()
+        before = len(report_history) if isinstance(report_history, list) else 0
+        report_history = [r for r in report_history if str(r.get("report_id")) != rid] if isinstance(report_history, list) else []
+        deleted = len(report_history) != before
+        if deleted:
+            report_ai_review_cache.pop(f"{rid}__summary", None)
+            report_ai_review_cache.pop(f"{rid}__summary_v", None)
+            report_buffett_review_cache.pop(rid, None)
+            report_buffett_review_cache.pop(f"{rid}__v", None)
+            report_buffett_review_cache.pop(f"{rid}__summary", None)
+            report_buffett_review_cache.pop(f"{rid}__summary_v", None)
+            report_detail_cache.pop(rid, None)
+            report_strategy_kline_cache = {k: v for k, v in report_strategy_kline_cache.items() if not str(k).startswith(f"{rid}|")}
+            persist_report_history()
+            _rebuild_strategy_score_cache()
+            latest_backtest_result = None
+            latest_strategy_reports = {}
+            if report_history and isinstance(report_history[0], dict):
+                latest_backtest_result = report_history[0].get("summary")
+                latest_strategy_reports = report_history[0].get("strategy_reports") if isinstance(report_history[0].get("strategy_reports"), dict) else {}
+            return {"status": "success", "deleted": True}
+        return {"status": "info", "deleted": False}
+    except Exception as e:
+        logger.error(f"/api/report/delete failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+def _select_provider():
+    cfg = ConfigLoader.reload()
+    provider_source = current_provider_source or cfg.get("data_provider.source", "default")
+    if provider_source == "tushare":
+        return TushareProvider(token=cfg.get("data_provider.tushare_token"))
+    if provider_source == "akshare":
+        return AkshareProvider()
+    if provider_source == "mysql":
+        return MysqlProvider()
+    if provider_source == "postgresql":
+        return PostgresProvider()
+    if provider_source == "duckdb":
+        return DuckDbProvider()
+    if provider_source == "tdx":
+        return TdxProvider()
+    return DataProvider()
+
+
+def _normalize_symbol(code):
+    c = str(code or "").strip().upper()
+    if c.endswith(".SH") or c.endswith(".SZ"):
+        return c
+    if len(c) == 6 and c.isdigit():
+        return f"{c}.SH" if c.startswith("6") else f"{c}.SZ"
+    return c
+
+
+def _period_label_to_interval(period_label):
+    p = str(period_label or "").strip()
+    if p in {"1分钟", "1min"}:
+        return "1min"
+    if p in {"5分钟", "5min"}:
+        return "5min"
+    if p in {"10分钟", "10min"}:
+        return "10min"
+    if p in {"15分钟", "15min"}:
+        return "15min"
+    if p in {"30分钟", "30min"}:
+        return "30min"
+    if p in {"60分钟", "60min", "1小时"}:
+        return "60min"
+    return "D"
+
+
+def _kline_type_to_period_label(kline_type):
+    tf = str(kline_type or "").strip()
+    low = tf.lower()
+    if low in {"d", "1d", "day", "daily"}:
+        return "日线"
+    if low.endswith("min"):
+        return f"{low.replace('min', '')}分钟"
+    return tf or "1分钟"
+
+
+def _strategy_period_label(strategy_id, srep=None):
+    if isinstance(srep, dict):
+        tf = str(srep.get("kline_type", "")).strip()
+        if tf:
+            return _kline_type_to_period_label(tf)
+        pl = str(srep.get("period_label", "")).strip()
+        if pl:
+            return pl
+    sid = str(strategy_id or "")
+    try:
+        for item in list_all_strategy_meta():
+            if str(item.get("id", "")) == sid:
+                return _kline_type_to_period_label(item.get("kline_type", "1min"))
+    except Exception:
+        pass
+    return "1分钟"
+
+
+def _cache_key_daily(stock_code, start_dt, end_dt):
+    return f"{stock_code}|{start_dt.strftime('%Y-%m-%d')}|{end_dt.strftime('%Y-%m-%d')}"
+
+
+def _backtest_progress_cache_key(end_dt):
+    raw = current_backtest_progress.get("current_date")
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered == "done":
+        return pd.to_datetime(end_dt).strftime("%Y-%m-%d")
+    if lowered == "failed":
+        return "failed"
+    return text
+
+
+def _cache_key_backtest_payload(stock_code, start_dt, end_dt, progress_key):
+    s = pd.to_datetime(start_dt).strftime("%Y-%m-%d")
+    e = pd.to_datetime(end_dt).strftime("%Y-%m-%d")
+    return f"{stock_code}|{s}|{e}|{progress_key}"
+
+
+def _get_cached_backtest_kline_payload(cache_key):
+    cached = backtest_kline_payload_cache.get(cache_key)
+    if not isinstance(cached, dict):
+        return None
+    expires_at = float(cached.get("expires_at", 0.0) or 0.0)
+    now_ts = datetime.now().timestamp()
+    if expires_at > 0 and now_ts <= expires_at:
+        payload = cached.get("payload")
+        if isinstance(payload, dict):
+            return payload
+    backtest_kline_payload_cache.pop(cache_key, None)
+    return None
+
+
+def _set_cached_backtest_kline_payload(cache_key, payload):
+    if not isinstance(payload, dict):
+        return
+    now_ts = datetime.now().timestamp()
+    backtest_kline_payload_cache[cache_key] = {
+        "payload": payload,
+        "expires_at": now_ts + float(BACKTEST_KLINE_PAYLOAD_CACHE_TTL_SECONDS)
+    }
+    while len(backtest_kline_payload_cache) > int(BACKTEST_KLINE_PAYLOAD_CACHE_MAX_ITEMS):
+        first_key = next(iter(backtest_kline_payload_cache))
+        if first_key == cache_key and len(backtest_kline_payload_cache) == 1:
+            break
+        backtest_kline_payload_cache.pop(first_key, None)
+
+
+def _invalidate_backtest_kline_payload_cache(stock_code=None):
+    if not stock_code:
+        backtest_kline_payload_cache.clear()
+        return
+    norm = _normalize_symbol(stock_code)
+    prefix = f"{norm}|"
+    keys = [k for k in backtest_kline_payload_cache.keys() if str(k).startswith(prefix)]
+    for k in keys:
+        backtest_kline_payload_cache.pop(k, None)
+
+
+def _get_cached_daily_df(stock_code, start_dt, end_dt):
+    key = _cache_key_daily(stock_code, start_dt, end_dt)
+    cached = kline_daily_cache.get(key)
+    if isinstance(cached, pd.DataFrame) and not cached.empty:
+        return cached.copy()
+    provider = _select_provider()
+    df = pd.DataFrame()
+    if hasattr(provider, "fetch_kline_data"):
+        df = provider.fetch_kline_data(stock_code, start_dt, end_dt, interval="D")
+    if (df is None or df.empty) and hasattr(provider, "fetch_minute_data"):
+        mdf = provider.fetch_minute_data(stock_code, start_dt, end_dt)
+        if mdf is not None and not mdf.empty:
+            from src.utils.indicators import Indicators
+            df = Indicators.resample(mdf, "D")
+    if df is None or df.empty:
+        return pd.DataFrame()
+    kline_daily_cache[key] = df.copy()
+    if len(kline_daily_cache) > 20:
+        first_key = next(iter(kline_daily_cache))
+        if first_key != key:
+            kline_daily_cache.pop(first_key, None)
+    return df.copy()
+
+
+def _build_backtest_kline_payload(stock_code, start_dt, end_dt):
+    df = _get_cached_daily_df(stock_code, start_dt, end_dt)
+    if df is None or df.empty:
+        return None
+    if "dt" not in df.columns:
+        raise RuntimeError("missing dt")
+    if "vol" not in df.columns and "volume" in df.columns:
+        df["vol"] = df["volume"]
+    if "volume" not in df.columns and "vol" in df.columns:
+        df["volume"] = df["vol"]
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c not in df.columns:
+            raise RuntimeError(f"missing {c}")
+    df["dt"] = pd.to_datetime(df["dt"])
+    df = df.dropna(subset=["dt"]).sort_values("dt")
+    progress_date = None
+    progress_date_text = None
+    if current_backtest_report:
+        raw_current_date = current_backtest_progress.get("current_date")
+        text_current_date = str(raw_current_date or "").strip()
+        if text_current_date.lower() == "done":
+            current_date = pd.to_datetime(end_dt, errors="coerce")
+        elif text_current_date.lower() == "failed":
+            current_date = pd.NaT
+        else:
+            current_date = pd.to_datetime(raw_current_date, errors="coerce")
+        if not pd.isna(current_date):
+            progress_date = current_date
+            progress_date_text = current_date.strftime("%Y-%m-%d")
+    df = df[(df["dt"] >= start_dt) & (df["dt"] <= end_dt)]
+    if df.empty:
+        return {"candles": [], "volumes": [], "markers": [], "strategies": [], "progress_date": progress_date_text}
+    plot_df = df[["dt", "open", "high", "low", "close", "volume"]].copy()
+    plot_df["dt"] = pd.to_datetime(plot_df["dt"])
+    candles = []
+    volumes = []
+    for _, r in plot_df.iterrows():
+        t = r["dt"].strftime("%Y-%m-%d")
+        o = float(r["open"])
+        h = float(r["high"])
+        l = float(r["low"])
+        c = float(r["close"])
+        v = float(r["volume"])
+        candles.append({"time": t, "open": o, "high": h, "low": l, "close": c})
+        volumes.append({"time": t, "value": v, "color": "#ef4444" if c >= o else "#22c55e"})
+    symbol_plain = stock_code.replace(".SH", "").replace(".SZ", "")
+    trades = [
+        t for t in current_backtest_trades
+        if str(t.get("code", "")).replace(".SH", "").replace(".SZ", "") == symbol_plain
+    ]
+    strategy_ids = sorted(set(str(t.get("strategy", "")).strip() for t in trades if str(t.get("strategy", "")).strip()))
+    palette = [
+        "#60a5fa", "#a78bfa", "#22d3ee", "#f59e0b", "#f472b6", "#38bdf8", "#c084fc", "#fb7185",
+        "#2dd4bf", "#fbbf24", "#818cf8", "#06b6d4", "#e879f9", "#0ea5e9", "#f97316", "#8b5cf6",
+        "#14b8a6", "#93c5fd", "#f0abfc", "#67e8f9", "#fcd34d", "#7dd3fc", "#d8b4fe", "#f9a8d4"
+    ]
+    color_map = {sid: palette[i % len(palette)] for i, sid in enumerate(strategy_ids)}
+    strategy_name_map = {str(x.get("id", "")): str(x.get("name", "")) for x in list_all_strategy_meta()}
+    markers = []
+    for t in trades:
+        sid = str(t.get("strategy", "")).strip()
+        if not sid:
+            continue
+        dt = pd.to_datetime(t.get("dt"))
+        if pd.isna(dt):
+            continue
+        d = dt.strftime("%Y-%m-%d")
+        if d < start_dt.strftime("%Y-%m-%d") or d > end_dt.strftime("%Y-%m-%d"):
+            continue
+        if progress_date is not None and dt.date() > progress_date.date():
+            continue
+        direction = str(t.get("dir", "")).upper()
+        is_buy = direction == "BUY"
+        trade_price = t.get("price")
+        try:
+            price_text = f"{float(trade_price):.2f}"
+        except Exception:
+            price_text = ""
+        markers.append({
+            "time": d,
+            "strategy_id": sid,
+            "position": "belowBar" if is_buy else "aboveBar",
+            "shape": "arrowUp" if is_buy else "arrowDown",
+            "color": color_map.get(sid, "#60a5fa"),
+            "text": price_text
+        })
+    strategy_legends = [{"id": sid, "name": strategy_name_map.get(sid, f"策略{sid}"), "color": color_map[sid]} for sid in strategy_ids]
+    return {
+        "candles": candles,
+        "volumes": volumes,
+        "markers": markers,
+        "strategies": strategy_legends,
+        "progress_date": progress_date_text
+    }
+
+
+def _pattern_thumb_path(stock_code, start_dt, end_dt):
+    os.makedirs(PATTERN_THUMB_DIR, exist_ok=True)
+    norm = _normalize_symbol(stock_code).replace(".", "_")
+    s = pd.to_datetime(start_dt).strftime("%Y%m%d")
+    e = pd.to_datetime(end_dt).strftime("%Y%m%d")
+    return os.path.join(PATTERN_THUMB_DIR, f"{norm}_{s}_{e}.png")
+
+
+def _render_pattern_thumb_png(stock_code, start_dt, end_dt):
+    import mplfinance as mpf
+    import matplotlib.pyplot as plt
+    img_path = _pattern_thumb_path(stock_code, start_dt, end_dt)
+    if os.path.exists(img_path):
+        return img_path
+    df = _get_cached_daily_df(stock_code, start_dt, end_dt)
+    if df is None or df.empty:
+        return None
+    if "dt" not in df.columns:
+        return None
+    for c in ["open", "high", "low", "close"]:
+        if c not in df.columns:
+            return None
+    plot_df = df[["dt", "open", "high", "low", "close"]].copy()
+    plot_df["Date"] = pd.to_datetime(plot_df["dt"])
+    plot_df = plot_df.set_index("Date")
+    plot_df = plot_df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
+    mc = mpf.make_marketcolors(up="#ef4444", down="#22c55e", edge="inherit", wick="inherit", volume="inherit")
+    s = mpf.make_mpf_style(base_mpf_style="charles", marketcolors=mc, facecolor="#020617", edgecolor="#334155", figcolor="#020617", gridcolor="#334155")
+    fig, _ = mpf.plot(
+        plot_df,
+        type="candle",
+        style=s,
+        volume=False,
+        title=f"{stock_code} 日K",
+        returnfig=True,
+        figsize=(4.4, 2.1),
+        xrotation=0
+    )
+    fig.savefig(img_path, format="png", dpi=130, bbox_inches="tight", pad_inches=0.05)
+    plt.close(fig)
+    return img_path
+
+
+def _warmup_classic_pattern_thumbs():
+    os.makedirs(PATTERN_THUMB_DIR, exist_ok=True)
+    ok = 0
+    for item in CLASSIC_PATTERN_ITEMS:
+        try:
+            stock_code = _normalize_symbol(item["stock"])
+            start_dt = pd.to_datetime(item["start"])
+            end_dt = pd.to_datetime(item["end"])
+            if pd.isna(start_dt) or pd.isna(end_dt) or start_dt > end_dt:
+                continue
+            p = _render_pattern_thumb_png(stock_code, start_dt, end_dt)
+            if p and os.path.exists(p):
+                ok += 1
+        except Exception:
+            continue
+    logger.info(f"classic pattern thumbs ready: {ok}/{len(CLASSIC_PATTERN_ITEMS)}")
+    return ok
+
+
+def _build_loading_svg_bytes(text: str) -> bytes:
+    safe = str(text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' width='440' height='210' viewBox='0 0 440 210'>"
+        "<rect width='440' height='210' fill='#020617'/>"
+        "<rect x='8' y='8' width='424' height='194' rx='8' fill='#0f172a' stroke='#334155' stroke-width='2'/>"
+        "<text x='220' y='102' text-anchor='middle' fill='#cbd5e1' font-size='16' font-family='Microsoft YaHei,SimHei,DejaVu Sans'>"
+        "经典形态缩略图加载中"
+        "</text>"
+        f"<text x='220' y='130' text-anchor='middle' fill='#94a3b8' font-size='12' font-family='Microsoft YaHei,SimHei,DejaVu Sans'>{safe}</text>"
+        "</svg>"
+    )
+    return svg.encode("utf-8")
+
+
+def _pattern_thumb_build_key(stock_code, start_dt, end_dt):
+    s = pd.to_datetime(start_dt).strftime("%Y-%m-%d")
+    e = pd.to_datetime(end_dt).strftime("%Y-%m-%d")
+    return f"{_normalize_symbol(stock_code)}|{s}|{e}"
+
+
+def _count_ready_pattern_thumbs():
+    ready = 0
+    for item in CLASSIC_PATTERN_ITEMS:
+        try:
+            stock_code = _normalize_symbol(item["stock"])
+            start_dt = pd.to_datetime(item["start"])
+            end_dt = pd.to_datetime(item["end"])
+            path = _pattern_thumb_path(stock_code, start_dt, end_dt)
+            if os.path.exists(path):
+                ready += 1
+        except Exception:
+            continue
+    return ready
+
+
+def _pattern_thumb_warmup_snapshot():
+    snap = dict(pattern_thumb_warmup_state)
+    with pattern_thumb_building_lock:
+        building = len(pattern_thumb_building_keys)
+    snap["building"] = int(building)
+    snap["ready"] = int(_count_ready_pattern_thumbs())
+    snap["total"] = len(CLASSIC_PATTERN_ITEMS)
+    snap["is_ready"] = snap["ready"] >= snap["total"] and snap["total"] > 0
+    return snap
+
+
+def _ensure_pattern_thumb_background_build(stock_code, start_dt, end_dt):
+    key = _pattern_thumb_build_key(stock_code, start_dt, end_dt)
+    img_path = _pattern_thumb_path(stock_code, start_dt, end_dt)
+    if os.path.exists(img_path):
+        return "ready"
+    with pattern_thumb_building_lock:
+        if key in pattern_thumb_building_keys:
+            return "building"
+        pattern_thumb_building_keys.add(key)
+
+    async def _runner():
+        try:
+            await asyncio.to_thread(_render_pattern_thumb_png, stock_code, start_dt, end_dt)
+        except Exception as e:
+            logger.warning(f"pattern thumb build failed: {key} err={e}")
+        finally:
+            with pattern_thumb_building_lock:
+                pattern_thumb_building_keys.discard(key)
+
+    asyncio.create_task(_runner())
+    return "queued"
+
+
+def _ensure_pattern_thumb_warmup_task():
+    global pattern_thumb_warmup_task
+    if pattern_thumb_warmup_task and not pattern_thumb_warmup_task.done():
+        return
+
+    async def _runner():
+        pattern_thumb_warmup_state["status"] = "running"
+        pattern_thumb_warmup_state["started_at"] = datetime.now().isoformat(timespec="seconds")
+        pattern_thumb_warmup_state["finished_at"] = None
+        try:
+            ready_count = await asyncio.to_thread(_warmup_classic_pattern_thumbs)
+            pattern_thumb_warmup_state["status"] = "done"
+            pattern_thumb_warmup_state["ready"] = int(ready_count)
+        except Exception as e:
+            pattern_thumb_warmup_state["status"] = "error"
+            pattern_thumb_warmup_state["error"] = str(e)
+            logger.error(f"classic pattern warmup task failed: {e}", exc_info=True)
+        finally:
+            pattern_thumb_warmup_state["finished_at"] = datetime.now().isoformat(timespec="seconds")
+
+    pattern_thumb_warmup_task = asyncio.create_task(_runner())
+
+
+@app.get("/api/backtest/kline_data")
+async def api_backtest_kline_data(stock: str, start: str, end: str):
+    try:
+        stock_code = _normalize_symbol(stock)
+        start_dt = pd.to_datetime(start)
+        end_dt = pd.to_datetime(end)
+        if pd.isna(start_dt) or pd.isna(end_dt) or start_dt > end_dt:
+            return {"status": "error", "msg": "invalid date range"}
+        progress_key = _backtest_progress_cache_key(end_dt)
+        cache_key = _cache_key_backtest_payload(stock_code, start_dt, end_dt, progress_key)
+        cached_payload = _get_cached_backtest_kline_payload(cache_key)
+        if isinstance(cached_payload, dict):
+            return {"status": "success", "stock": stock_code, **cached_payload}
+        payload = await asyncio.to_thread(_build_backtest_kline_payload, stock_code, start_dt, end_dt)
+        if payload is None:
+            return {"status": "error", "msg": "no data"}
+        _set_cached_backtest_kline_payload(cache_key, payload)
+        return {"status": "success", "stock": stock_code, **payload}
+    except Exception as e:
+        logger.error(f"/api/backtest/kline_data failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+
+@app.get("/api/backtest/kline_chart")
+async def api_backtest_kline_chart(stock: str, start: str, end: str):
+    try:
+        import mplfinance as mpf
+        import matplotlib.pyplot as plt
+        stock_code = _normalize_symbol(stock)
+        start_dt = pd.to_datetime(start)
+        end_dt = pd.to_datetime(end)
+        if pd.isna(start_dt) or pd.isna(end_dt) or start_dt > end_dt:
+            return Response(content="invalid date range", media_type="text/plain", status_code=400)
+        payload = await asyncio.to_thread(_build_backtest_kline_payload, stock_code, start_dt, end_dt)
+        if payload is None:
+            return Response(content="no data", media_type="text/plain", status_code=404)
+        if not payload["candles"]:
+            return Response(content="no visible bars", media_type="text/plain", status_code=404)
+        plot_df = pd.DataFrame(payload["candles"]).copy()
+        plot_df["Date"] = pd.to_datetime(plot_df["time"])
+        plot_df = plot_df.set_index("Date")
+        plot_df = plot_df.rename(columns={"open": "Open", "high": "High", "low": "Low", "close": "Close"})
+        vol_df = pd.DataFrame(payload["volumes"]).copy()
+        vol_df["Date"] = pd.to_datetime(vol_df["time"])
+        vol_df = vol_df.set_index("Date")
+        plot_df["Volume"] = vol_df["value"]
+        strategy_ids = [x["id"] for x in payload["strategies"]]
+        color_map = {x["id"]: x["color"] for x in payload["strategies"]}
+        date_index_map = {d.strftime("%Y-%m-%d"): d for d in plot_df.index}
+        buy_map = {sid: pd.Series(np.nan, index=plot_df.index) for sid in strategy_ids}
+        sell_map = {sid: pd.Series(np.nan, index=plot_df.index) for sid in strategy_ids}
+        for m in payload["markers"]:
+            sid = str(m.get("strategy_id", ""))
+            if sid not in buy_map:
+                continue
+            t = str(m.get("time", ""))
+            candle_dt = date_index_map.get(t)
+            if candle_dt is None:
+                continue
+            if m.get("shape") == "arrowUp":
+                buy_map[sid].loc[candle_dt] = float(plot_df.loc[candle_dt, "Low"]) * 0.995
+            else:
+                sell_map[sid].loc[candle_dt] = float(plot_df.loc[candle_dt, "High"]) * 1.005
+        addplots = []
+        legend_handles = []
+        for st in payload["strategies"]:
+            sid = st["id"]
+            color = color_map[sid]
+            if buy_map[sid].notna().any():
+                addplots.append(mpf.make_addplot(buy_map[sid], type="scatter", marker="^", markersize=60, color=color, panel=0))
+            if sell_map[sid].notna().any():
+                addplots.append(mpf.make_addplot(sell_map[sid], type="scatter", marker="v", markersize=60, color=color, panel=0))
+            legend_handles.append(mlines.Line2D([], [], color=color, marker="o", linestyle="None", label=st["name"]))
+            legend_handles.append(mlines.Line2D([], [], color="#e2e8f0", marker="^", linestyle="None", label="硅基信号"))
+            legend_handles.append(mlines.Line2D([], [], color="#e2e8f0", marker="v", linestyle="None", label="流码信号"))
+        plot_kwargs = {
+            "type": "candle",
+            "style": "charles",
+            "volume": True,
+            "title": f"{stock_code} 日K线（含成交量）",
+            "returnfig": True,
+            "figsize": (13, 8)
+        }
+        if addplots:
+            plot_kwargs["addplot"] = addplots
+        fig, axes = mpf.plot(plot_df, **plot_kwargs)
+        if axes and legend_handles:
+            axes[0].legend(handles=legend_handles, loc="upper left", fontsize=8, ncol=2, framealpha=0.65)
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="image/png")
+    except Exception as e:
+        logger.error(f"/api/backtest/kline_chart failed: {e}", exc_info=True)
+        return Response(content=str(e), media_type="text/plain", status_code=500)
+
+
+@app.get("/api/backtest/kline_thumb")
+async def api_backtest_kline_thumb(stock: str, start: str, end: str):
+    try:
+        stock_code = _normalize_symbol(stock)
+        start_dt = pd.to_datetime(start)
+        end_dt = pd.to_datetime(end)
+        if pd.isna(start_dt) or pd.isna(end_dt) or start_dt > end_dt:
+            return Response(content="invalid date range", media_type="text/plain", status_code=400)
+        img_path = _pattern_thumb_path(stock_code, start_dt, end_dt)
+        if os.path.exists(img_path):
+            return FileResponse(img_path, media_type="image/png")
+        queue_state = _ensure_pattern_thumb_background_build(stock_code, start_dt, end_dt)
+        hint = "正在准备K线数据"
+        if queue_state == "building":
+            hint = "后台生成中"
+        elif queue_state == "queued":
+            hint = "已加入后台队列"
+        return Response(
+            content=_build_loading_svg_bytes(hint),
+            media_type="image/svg+xml",
+            status_code=200,
+            headers={"Cache-Control": "no-store"}
+        )
+    except Exception as e:
+        logger.error(f"/api/backtest/kline_thumb failed: {e}", exc_info=True)
+        return Response(content=str(e), media_type="text/plain", status_code=500)
+
+
+@app.get("/api/backtest/kline_thumb_status")
+async def api_backtest_kline_thumb_status(stock: str, start: str, end: str):
+    try:
+        stock_code = _normalize_symbol(stock)
+        start_dt = pd.to_datetime(start)
+        end_dt = pd.to_datetime(end)
+        if pd.isna(start_dt) or pd.isna(end_dt) or start_dt > end_dt:
+            return {"status": "error", "msg": "invalid date range"}
+        img_path = _pattern_thumb_path(stock_code, start_dt, end_dt)
+        if os.path.exists(img_path):
+            return {"status": "success", "ready": True, "building": False}
+        queue_state = _ensure_pattern_thumb_background_build(stock_code, start_dt, end_dt)
+        return {"status": "success", "ready": False, "building": queue_state in {"building", "queued"}}
+    except Exception as e:
+        logger.error(f"/api/backtest/kline_thumb_status failed: {e}", exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+# --- Control Endpoints for External Systems (e.g. OpenClaw) ---
+@app.post("/api/control/start_backtest")
+async def api_start_backtest(req: BacktestRequest):
+    """Start a backtest task (useful for OpenClaw API calls)"""
+    global cabinet_task
+    cfg = ConfigLoader.reload()
+    if _system_mode(cfg) != "backtest":
+        return {"status": "error", "msg": "当前运行模式非回测模式（system.mode=live），请先切换配置中心运行模式"}
+    logger.info(
+        "start_backtest request params: stock_code=%s strategy_id=%s strategy_ids=%s strategy_mode=%s combination=%s start=%s end=%s capital=%s realtime_push=%s",
+        req.stock_code,
+        req.strategy_id,
+        req.strategy_ids,
+        req.strategy_mode,
+        req.combination_config,
+        req.start,
+        req.end,
+        req.capital,
+        req.realtime_push,
+    )
+    if cabinet_task and not cabinet_task.done():
+        if current_backtest_report and str(current_backtest_report.get("status", "")).lower() == "running":
+            cancel_current_backtest_report("backtest replaced by new request")
+        cabinet_task.cancel()
+        cabinet_task = None
+    if _live_running_codes():
+        await _stop_live_tasks(clear_profile=True)
+    report_id = start_new_backtest_report(req.stock_code, req.strategy_id, {
+        "stock_code": req.stock_code,
+        "strategy_id": req.strategy_id,
+        "strategy_ids": req.strategy_ids,
+        "strategy_mode": req.strategy_mode,
+        "combination_config": req.combination_config,
+        "start": req.start,
+        "end": req.end,
+        "capital": req.capital,
+        "realtime_push": req.realtime_push,
+    })
+    _spawn_backtest_task(
+        req.stock_code,
+        req.strategy_id,
+        req.strategy_mode,
+        req.start,
+        req.end,
+        req.capital,
+        req.strategy_ids,
+        req.combination_config,
+        report_id,
+        req.realtime_push,
+    )
+    return {"status": "success", "msg": f"Backtest started for {req.stock_code}", "report_id": report_id}
+
+@app.post("/api/control/start_live")
+async def api_start_live(req: LiveRequest):
+    """Start a live simulation task"""
+    if not is_live_enabled():
+        return {"status": "error", "msg": "Live功能已禁用（需 system.mode=live）"}
+    global cabinet_task
+    if cabinet_task and not cabinet_task.done():
+        if current_backtest_report and str(current_backtest_report.get("status", "")).lower() == "running":
+            cancel_current_backtest_report("backtest stopped by live start")
+        cabinet_task.cancel()
+        cabinet_task = None
+    _clear_live_last_error()
+    codes = _normalize_live_codes(stock_code=req.stock_code, stock_codes=req.stock_codes)
+    common_selection = _normalize_strategy_selection(strategy_id=req.strategy_id, strategy_ids=req.strategy_ids)
+    stock_strategy_map = _normalize_stock_strategy_map(req.stock_strategy_map)
+    if bool(req.replace_existing):
+        await _stop_live_tasks(clear_profile=True)
+    cfg = ConfigLoader.reload()
+    total_capital = float(req.total_capital if req.total_capital is not None else (cfg.get("system.initial_capital", 1000000.0) or 1000000.0))
+    all_target_codes = list(codes) if bool(req.replace_existing) else list(dict.fromkeys(_live_running_codes() + codes))
+    cap_plan, cap_mode, cap_weights = _build_live_capital_plan(
+        codes=all_target_codes,
+        total_capital=total_capital,
+        allocation_mode=req.allocation_mode,
+        allocation_weights=req.allocation_weights
+    )
+    global live_capital_plan_mode, live_capital_plan_weights
+    live_capital_plan_mode = cap_mode
+    live_capital_plan_weights = cap_weights
+    for code, cap in cap_plan.items():
+        live_capital_profiles[code] = float(cap)
+    started = []
+    already_running = []
+    for stock_code in codes:
+        if stock_code in stock_strategy_map:
+            live_strategy_profiles[stock_code] = stock_strategy_map[stock_code]
+        elif common_selection is not None:
+            live_strategy_profiles[stock_code] = common_selection
+        task = live_tasks.get(stock_code)
+        if task and not task.done():
+            already_running.append(stock_code)
+            continue
+        live_tasks[stock_code] = asyncio.create_task(run_cabinet_task(stock_code))
+        started.append(stock_code)
+    if not started and already_running:
+        return {"status": "info", "msg": "all targets already running", "running_codes": _live_running_codes(), "strategy_profiles": _profile_snapshot()}
+    summary_text = _format_live_start_summary(started)
+    await _broadcast_system_and_notify(f"当前实盘已启动：{summary_text}", started)
+    return {
+        "status": "success",
+        "msg": f"Live monitoring started for {','.join(started)}",
+        "started_codes": started,
+        "running_codes": _live_running_codes(),
+        "strategy_profiles": _profile_snapshot(),
+        "capital_profiles": _capital_snapshot(),
+        "capital_total": float(total_capital),
+        "allocation_mode": live_capital_plan_mode,
+        "allocation_weights": live_capital_plan_weights
+    }
+
+@app.post("/api/control/stop")
+async def api_stop_task(request: Request):
+    """Stop the current running task"""
+    global cabinet_task
+    force_fast = False
+    released_task_ref = bool(cabinet_task is None or (cabinet_task is not None and cabinet_task.done()))
+    try:
+        payload = await request.json()
+        if isinstance(payload, dict):
+            force_fast = bool(payload.get("force_fast") or payload.get("force"))
+    except Exception:
+        force_fast = False
+    stopped_live = []
+    running_live_codes = _live_running_codes()
+    if running_live_codes:
+        if force_fast:
+            async def _stop_live_async():
+                stopped = await _stop_live_tasks(clear_profile=True)
+                if stopped:
+                    await manager.broadcast({"type": "system", "data": {"msg": "内阁监控已手动停止"}})
+            asyncio.create_task(_stop_live_async())
+            stopped_live = running_live_codes
+        else:
+            stopped_live = await _stop_live_tasks(clear_profile=True)
+            await manager.broadcast({"type": "system", "data": {"msg": "内阁监控已手动停止"}})
+    if cabinet_task and not cabinet_task.done():
+        cabinet_task.cancel()
+        if current_backtest_report and str(current_backtest_report.get("status", "")).lower() == "running":
+            stop_reason = "backtest task force-stopped by user" if force_fast else "backtest task cancelled by user"
+            cancel_current_backtest_report(stop_reason)
+            if force_fast:
+                cabinet_task = None
+                released_task_ref = True
+            if force_fast:
+                asyncio.create_task(manager.broadcast({"type": "system", "data": {"msg": "回测已强制快速终止"}}))
+            else:
+                await manager.broadcast({"type": "system", "data": {"msg": "回测已手动终止"}})
+            return {
+                "status": "success",
+                "msg": "Backtest force-stopped" if force_fast else "Backtest stopped",
+                "stopped_live_codes": stopped_live,
+                "cleanup_state": {
+                    "released_task_ref": released_task_ref,
+                    "force_fast": force_fast
+                }
+            }
+        if force_fast:
+            cabinet_task = None
+            released_task_ref = True
+        return {
+            "status": "success",
+            "msg": "Task stopped",
+            "stopped_live_codes": stopped_live,
+            "cleanup_state": {
+                "released_task_ref": released_task_ref,
+                "force_fast": force_fast
+            }
+        }
+    if stopped_live:
+        return {
+            "status": "success",
+            "msg": "Live stopped",
+            "stopped_live_codes": stopped_live,
+            "cleanup_state": {
+                "released_task_ref": released_task_ref,
+                "force_fast": force_fast
+            }
+        }
+    return {
+        "status": "info",
+        "msg": "No task is currently running",
+        "cleanup_state": {
+            "released_task_ref": released_task_ref,
+            "force_fast": force_fast
+        }
+    }
+
+@app.post("/api/control/switch_strategy")
+async def api_switch_strategy(req: StrategySwitchRequest):
+    """Switch the active strategy on the fly"""
+    selected = _normalize_strategy_selection(strategy_id=req.strategy_id, strategy_ids=req.strategy_ids)
+    per_stock_selection = _normalize_stock_strategy_map(req.stock_strategy_map)
+    target_codes = _normalize_live_codes(stock_codes=req.stock_codes, use_default=False) if isinstance(req.stock_codes, list) and req.stock_codes else list(live_cabinets.keys())
+    updated = []
+    for code, pick in per_stock_selection.items():
+        live_strategy_profiles[code] = pick
+        cab = live_cabinets.get(code)
+        if cab:
+            cab.set_active_strategies(pick)
+            updated.append(code)
+    if selected is not None:
+        for code in target_codes:
+            live_strategy_profiles[code] = selected
+            cab = live_cabinets.get(code)
+            if cab:
+                cab.set_active_strategies(selected)
+                if code not in updated:
+                    updated.append(code)
+        if current_cabinet and (not target_codes):
+            current_cabinet.set_active_strategies(selected)
+            code = str(getattr(current_cabinet, "stock_code", "") or "").upper()
+            if code:
+                live_strategy_profiles[code] = selected
+                if code not in updated:
+                    updated.append(code)
+    if updated:
+        return {"status": "success", "msg": "Strategy switched", "updated_codes": updated, "strategy_profiles": _profile_snapshot()}
+    return {"status": "error", "msg": "No active cabinet running"}
+
+@app.post("/api/control/set_source")
+async def api_set_source(req: SourceSwitchRequest):
+    global cabinet_task, current_provider_source, current_cabinet, config
+    source = str(req.source or "").lower().strip()
+    if source not in {"default", "tushare", "akshare", "mysql", "postgresql", "duckdb", "tdx"}:
+        return {"status": "error", "msg": "source must be one of: default, tushare, akshare, mysql, postgresql, duckdb, tdx"}
+    cfg = ConfigLoader.reload()
+    cfg.set("data_provider.source", source)
+    cfg.save()
+    config = ConfigLoader.reload()
+    current_provider_source = source
+    restarted = False
+    running_codes = _live_running_codes()
+    if running_codes:
+        await _stop_live_tasks(running_codes)
+        for stock_code in running_codes:
+            live_tasks[stock_code] = asyncio.create_task(run_cabinet_task(stock_code))
+        restarted = True
+    await manager.broadcast({"type": "system", "data": {"msg": f"数据源已切换为 {source}"}})
+    return {"status": "success", "msg": f"source switched to {source}", "source": source, "live_restarted": restarted, "running_codes": _live_running_codes()}
+
+@app.post("/api/control/reload_strategies")
+async def api_reload_strategies():
+    """Hot reload strategies without restarting the server"""
+    logger.info("Received request to reload strategies...")
+    try:
+        # Reload the implemented_strategies module first
+        if 'src.strategies.implemented_strategies' in sys.modules:
+            importlib.reload(sys.modules['src.strategies.implemented_strategies'])
+            logger.info("Reloaded module: src.strategies.implemented_strategies")
+        
+        # Then reload the strategy_factory module
+        importlib.reload(strategy_factory_module)
+        logger.info("Reloaded module: src.strategies.strategy_factory")
+        
+        # Test if we can create strategies
+        strategies = strategy_factory_module.create_strategies()
+        strategy_count = len(strategies)
+        
+        strategy_names = [s.name for s in strategies]
+        logger.info(f"Strategy Factory Reloaded. Current Strategies ({strategy_count}): {strategy_names}")
+        
+        return {
+            "status": "success", 
+            "msg": f"Successfully reloaded {strategy_count} strategies.",
+            "strategies": strategy_names
+        }
+    except Exception as e:
+        logger.error(f"Failed to reload strategies: {str(e)}", exc_info=True)
+        return {"status": "error", "msg": f"Failed to reload strategies: {str(e)}"}
+
+def _build_status_payload(include_fund_pools: bool = True):
+    backtest_running = cabinet_task is not None and not cabinet_task.done()
+    running_codes = _live_running_codes()
+    is_running = backtest_running or bool(running_codes)
+    live_cap_map = _capital_snapshot(running_codes)
+    live_cap_total = float(sum(float(v or 0.0) for v in live_cap_map.values()))
+    payload = {
+        "is_running": is_running,
+        "backtest_running": backtest_running,
+        "live_running": bool(running_codes),
+        "live_running_codes": running_codes,
+        "live_task_count": len(running_codes),
+        "live_strategy_profiles": _profile_snapshot(running_codes),
+        "live_capital_profiles": live_cap_map,
+        "live_capital_total": live_cap_total,
+        "live_allocation_mode": str(live_capital_plan_mode or "equal"),
+        "live_allocation_weights": dict(live_capital_plan_weights or {}),
+        "active_cabinet_type": type(current_cabinet).__name__ if current_cabinet else None,
+        "live_last_error": live_last_error,
+        "provider_source": current_provider_source or config.get("data_provider.source", "default"),
+        "live_enabled": is_live_enabled(),
+        "server_boot_id": SERVER_BOOT_ID,
+        "server_started_at": SERVER_STARTED_AT,
+        "pattern_thumbs": _pattern_thumb_warmup_snapshot(),
+        "progress": current_backtest_progress,
+        "current_report_id": current_backtest_report.get("report_id") if current_backtest_report else None,
+        "current_report_status": current_backtest_report.get("status") if current_backtest_report else None,
+        "current_report_error": current_backtest_report.get("error_msg") if current_backtest_report else None
+    }
+    if include_fund_pools:
+        payload["live_fund_pools"] = _collect_live_fund_pools()
+    # FastAPI/Starlette JSON serialization is strict and rejects NaN/Inf.
+    # Normalize non-finite numbers to keep /api/status always serializable.
+    return _sanitize_non_finite(payload)
+
+@app.get("/api/status")
+async def api_get_status():
+    """Get current system status"""
+    return _build_status_payload(include_fund_pools=True)
+
+@app.get("/api/status/light")
+async def api_get_status_light():
+    """Get lightweight system status for high-frequency polling"""
+    return _build_status_payload(include_fund_pools=False)
+
+
+def _build_evolution_profile_payload(req: EvolutionStartRequest) -> Dict[str, Any]:
+    profile: Dict[str, Any] = {}
+    if req.seed_strategy_id is not None:
+        profile["seed_strategy_id"] = str(req.seed_strategy_id or "").strip()
+    if req.seed_strategy_ids is not None:
+        profile["seed_strategy_ids"] = [str(x or "").strip() for x in req.seed_strategy_ids if str(x or "").strip()]
+    if req.seed_include_builtin is not None:
+        profile["seed_include_builtin"] = bool(req.seed_include_builtin)
+    if req.seed_only_enabled is not None:
+        profile["seed_only_enabled"] = bool(req.seed_only_enabled)
+    if req.target_stock_codes is not None:
+        profile["target_stock_codes"] = [str(x or "").strip() for x in req.target_stock_codes if str(x or "").strip()]
+    if req.timeframes is not None:
+        profile["timeframes"] = [str(x or "").strip() for x in req.timeframes if str(x or "").strip()]
+    if req.persist_enabled is not None:
+        profile["persist_enabled"] = bool(req.persist_enabled)
+    if req.persist_score_threshold is not None:
+        profile["persist_score_threshold"] = float(req.persist_score_threshold)
+    if req.family_alert_preset is not None:
+        profile["family_alert_preset"] = str(req.family_alert_preset or "").strip().lower()
+    if req.family_adaptive_blend_ratio is not None:
+        profile["family_adaptive_blend_ratio"] = float(req.family_adaptive_blend_ratio)
+    return profile
+
+
+@app.post("/api/evolution/start")
+async def api_evolution_start(req: EvolutionStartRequest):
+    interval = float(req.interval_seconds if req.interval_seconds is not None else 1.0)
+    max_iters = req.max_iterations if req.max_iterations is not None else None
+    profile = _build_evolution_profile_payload(req)
+    # 使用请求来源作为operator_id
+    operator_id = f"api_user_{req.updated_by}" if hasattr(req, 'updated_by') and req.updated_by else "api_user"
+    state = evolution_runtime.start(interval_seconds=interval, max_iterations=max_iters, profile=profile, operator_id=operator_id)
+    
+    # 检查是否有并发冲突
+    if state.get("concurrency_conflict"):
+        return {"status": "error", "msg": state.get("error", "Concurrency conflict"), "state": state}
+    
+    return {"status": "success", "msg": "evolution started", "state": state}
+
+
+@app.post("/api/evolution/profile/update")
+async def api_evolution_profile_update(req: EvolutionProfileUpdateRequest):
+    raw = req.model_dump(exclude_none=True) if hasattr(req, "model_dump") else req.dict(exclude_none=True)
+    updated_by = str(raw.pop("updated_by", "") or "dashboard").strip() or "dashboard"
+    source = str(raw.pop("source", "") or "api").strip() or "api"
+    patch = _build_evolution_profile_payload(EvolutionStartRequest(**raw))
+    if not patch:
+        return {"status": "success", "msg": "profile unchanged", "state": evolution_runtime.status()}
+    # 获取更新前的配置用于审计
+    current_profile = evolution_runtime.get_profile()
+    
+    # 执行配置更新
+    state = evolution_runtime.update_profile(profile_patch=patch, updated_by=updated_by, source=source)
+    
+    # 持久化审计日志到PostgreSQL（如果启用）
+    try:
+        if evolution_profile_update_repo.enabled:
+            after_profile = evolution_runtime.get_profile()
+            evolution_profile_update_repo.insert_update(
+                updated_by=updated_by,
+                source=source,
+                running=state.get("running", False),
+                patch=patch,
+                before_profile=current_profile,
+                after_profile=after_profile
+            )
+    except Exception as e:
+        # 记录错误但不影响API响应
+        logger.warning(f"Failed to persist profile update audit log: {e}")
+    
+    return {"status": "success", "msg": "evolution profile updated", "state": state}
+
+
+@app.get("/api/evolution/profile/updates")
+async def api_evolution_profile_updates(limit: int = 30):
+    limit = max(1, min(int(limit or 30), 200))
+    
+    # 优先从PostgreSQL读取数据（如果启用）
+    if evolution_profile_update_repo.enabled:
+        try:
+            result = evolution_profile_update_repo.query_updates(limit=limit)
+            return {"status": "success", "rows": result.get("rows", []), "count": result.get("count", 0)}
+        except Exception as e:
+            logger.warning(f"Failed to query profile updates from PostgreSQL: {e}")
+            # 降级到内存数据
+    
+    # 从内存读取数据
+    rows = evolution_runtime.profile_updates(limit=limit)
+    return {"status": "success", "rows": rows, "count": len(rows)}
+
+
+@app.post("/api/evolution/stop")
+async def api_evolution_stop():
+    # 使用API用户作为operator_id
+    operator_id = "api_user"
+    state = evolution_runtime.stop(operator_id=operator_id)
+    
+    # 检查是否有并发冲突
+    if state.get("concurrency_conflict"):
+        return {"status": "error", "msg": state.get("error", "Concurrency conflict"), "state": state}
+    
+    return {"status": "success", "msg": "evolution stopped", "state": state}
+
+
+@app.get("/api/evolution/status")
+async def api_evolution_status():
+    return {"status": "success", "state": evolution_runtime.status()}
+
+
+@app.get("/api/evolution/concurrency")
+async def api_evolution_concurrency():
+    """获取进化系统并发状态信息"""
+    concurrency_status = evolution_runtime.get_concurrency_status()
+    return {"status": "success", "concurrency": concurrency_status}
+
+
+@app.get("/api/evolution/history")
+async def api_evolution_history(limit: int = 100):
+    rows = evolution_runtime.history(limit=max(1, min(int(limit or 100), 1000)))
+    return {"status": "success", "rows": rows, "count": len(rows)}
+
+
+@app.get("/api/evolution/top")
+async def api_evolution_top(k: int = 20):
+    rows = evolution_runtime.top_strategies(k=max(1, min(int(k or 20), 200)))
+    return {"status": "success", "rows": rows, "count": len(rows)}
+
+
+@app.get("/api/evolution/runs")
+async def api_evolution_runs(
+    limit: int = 100,
+    offset: int = 0,
+    run_id: Optional[str] = None,
+    child_gene_id: Optional[str] = None,
+    status: Optional[str] = None,
+    parent_strategy_id: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+):
+    result = _query_evolution_run_rows(
+        limit=max(1, min(int(limit or 100), 500)),
+        offset=max(0, int(offset or 0)),
+        run_id=str(run_id or "").strip(),
+        child_gene_id=str(child_gene_id or "").strip(),
+        status=str(status or "").strip(),
+        parent_strategy_id=str(parent_strategy_id or "").strip(),
+        start_time=str(start_time or "").strip(),
+        end_time=str(end_time or "").strip(),
+    )
+    rows = result.get("rows", []) if isinstance(result.get("rows"), list) else []
+    return {
+        "status": "success",
+        "enabled": bool(result.get("enabled", False)),
+        "rows": rows,
+        "count": int(result.get("count", 0) or 0),
+        "limit": int(result.get("limit", limit) or limit),
+        "offset": int(result.get("offset", offset) or offset),
+        "error": str(result.get("error", "") or ""),
+    }
+
+
+@app.post("/api/evolution/runs")
+async def api_evolution_runs_create(req: EvolutionRunUpsertRequest):
+    row = _save_evolution_run_row(req.model_dump(exclude_none=True) if hasattr(req, "model_dump") else req.dict(exclude_none=True))
+    return {"status": "success", "row": _safe_json_obj(row)}
+
+
+@app.put("/api/evolution/runs/{run_id}")
+async def api_evolution_runs_update(run_id: str, req: EvolutionRunUpsertRequest):
+    payload = req.model_dump(exclude_none=True) if hasattr(req, "model_dump") else req.dict(exclude_none=True)
+    row = _save_evolution_run_row(payload, original_run_id=str(run_id or "").strip())
+    return {"status": "success", "row": _safe_json_obj(row)}
+
+
+@app.delete("/api/evolution/runs/{run_id}")
+async def api_evolution_runs_delete(run_id: str):
+    deleted = _delete_evolution_run_row(str(run_id or "").strip())
+    return {"status": "success", "deleted": bool(deleted)}
+
+
+@app.get("/api/evolution/family_stats")
+async def api_evolution_family_stats(
+    limit: int = 100,
+    offset: int = 0,
+    family: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+):
+    result = _query_evolution_family_rows(
+        limit=max(1, min(int(limit or 100), 500)),
+        offset=max(0, int(offset or 0)),
+        family=str(family or "").strip(),
+        start_time=str(start_time or "").strip(),
+        end_time=str(end_time or "").strip(),
+    )
+    rows = result.get("rows", []) if isinstance(result.get("rows"), list) else []
+    family_weights = evolution_gene_adapter.get_family_weight_snapshot()
+    cfg = ConfigLoader.reload()
+    family_alert_threshold = float(cfg.get("evolution.gene.family_alert_threshold", 0.18) or 0.18)
+    if isinstance(family_weights, dict):
+        family_weights["alert_threshold"] = family_alert_threshold
+    return {
+        "status": "success",
+        "enabled": bool(result.get("enabled", False)),
+        "rows": rows,
+        "count": int(result.get("count", 0) or 0),
+        "limit": int(result.get("limit", limit) or limit),
+        "offset": int(result.get("offset", offset) or offset),
+        "family_weights": family_weights if isinstance(family_weights, dict) else {},
+        "family_alert_threshold": family_alert_threshold,
+        "error": str(result.get("error", "") or ""),
+    }
+
+
+@app.post("/api/evolution/family")
+async def api_evolution_family_create(req: EvolutionFamilyUpsertRequest):
+    row = _save_evolution_family_row(req.model_dump(exclude_none=True) if hasattr(req, "model_dump") else req.dict(exclude_none=True))
+    return {"status": "success", "row": _safe_json_obj(row)}
+
+
+@app.put("/api/evolution/family/{family}")
+async def api_evolution_family_update(family: str, req: EvolutionFamilyUpsertRequest):
+    payload = req.model_dump(exclude_none=True) if hasattr(req, "model_dump") else req.dict(exclude_none=True)
+    row = _save_evolution_family_row(payload, original_family=str(family or "").strip())
+    return {"status": "success", "row": _safe_json_obj(row)}
+
+
+@app.delete("/api/evolution/family/{family}")
+async def api_evolution_family_delete(family: str):
+    deleted = _delete_evolution_family_row(str(family or "").strip())
+    return {"status": "success", "deleted": bool(deleted)}
+
+
+@app.get("/api/evolution/platform/overview")
+async def api_evolution_platform_overview():
+    return {"status": "success", **evolution_platform_hub.get_overview()}
+
+
+@app.get("/api/live/fund_pool")
+async def api_get_live_fund_pool(stock_code: Optional[str] = None, include_transactions: bool = False, tx_limit: int = 200):
+    limit = max(1, min(int(tx_limit or 200), 5000))
+    if stock_code:
+        snap = _load_live_fund_pool_snapshot(stock_code, include_transactions=include_transactions, tx_limit=limit)
+        if snap is None:
+            return {"status": "error", "msg": "fund pool not found", "stock_code": str(stock_code).upper()}
+        return {"status": "success", "stock_code": str(stock_code).upper(), "fund_pool": snap}
+    return {"status": "success", "fund_pools": _collect_live_fund_pools(include_transactions=include_transactions, tx_limit=limit)}
+
+@app.post("/api/live/fund_pool/reset")
+async def api_reset_live_fund_pool(req: LiveFundPoolResetRequest):
+    code = str(req.stock_code or "").strip().upper()
+    if not code:
+        return {"status": "error", "msg": "stock_code required"}
+    cfg = ConfigLoader.reload()
+    cap = float(req.initial_capital) if req.initial_capital is not None else float(_default_live_fund_pool_capital(code, cfg))
+    if cap <= 0:
+        return {"status": "error", "msg": "initial_capital must be positive"}
+    cab = live_cabinets.get(code)
+    if cab is not None:
+        cab.revenue.initial_capital = cap
+        cab.revenue.cash = cap
+        cab.revenue.transactions = []
+        cab.revenue.total_commission = 0.0
+        cab.revenue.total_stamp_duty = 0.0
+        cab.revenue.total_transfer_fee = 0.0
+        cab.state_affairs.positions = {}
+        cab.peak_fund_value = cap
+        cab._persist_virtual_fund_pool()
+        await emit_event_to_ws("fund_pool", cab.get_fund_pool_snapshot(include_transactions=False), stock_code=code)
+        return {"status": "success", "msg": f"fund pool reset: {code}", "fund_pool": cab.get_fund_pool_snapshot(include_transactions=False)}
+    payload = _empty_live_fund_pool_state(code, cap)
+    _write_json_file(_live_fund_pool_file(code), payload)
+    return {"status": "success", "msg": f"fund pool reset: {code}", "fund_pool": payload.get("state", {})}
+
+@app.get("/api/webhook/failed")
+async def api_webhook_failed(limit: int = 200):
+    if not is_live_enabled():
+        return {"status": "error", "msg": "当前为回测模式，推送补偿仅在实盘模式可用"}
+    try:
+        events = webhook_notifier.get_failed_events(limit=max(1, min(int(limit or 200), 1000)))
+        return {"status": "success", "events": events, "count": len(events)}
+    except Exception as e:
+        logger.error("list webhook failed queue error: %s", e, exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+@app.post("/api/webhook/failed/retry")
+async def api_webhook_retry_failed(req: WebhookRetryRequest):
+    if not is_live_enabled():
+        return {"status": "error", "msg": "当前为回测模式，推送补偿仅在实盘模式可用"}
+    try:
+        result = await webhook_notifier.retry_failed_events(
+            event_ids=req.event_ids if isinstance(req.event_ids, list) else None,
+            limit=max(1, min(int(req.limit or 20), 500))
+        )
+        events = webhook_notifier.get_failed_events(limit=200)
+        return {"status": "success", "result": result, "events": events, "count": len(events)}
+    except Exception as e:
+        logger.error("retry webhook failed queue error: %s", e, exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+@app.post("/api/webhook/failed/delete")
+async def api_webhook_delete_failed(req: WebhookDeleteRequest):
+    if not is_live_enabled():
+        return {"status": "error", "msg": "当前为回测模式，推送补偿仅在实盘模式可用"}
+    try:
+        result = webhook_notifier.delete_failed_events(
+            event_ids=req.event_ids if isinstance(req.event_ids, list) else None
+        )
+        events = webhook_notifier.get_failed_events(limit=200)
+        return {"status": "success", "result": result, "events": events, "count": len(events)}
+    except Exception as e:
+        logger.error("delete webhook failed queue error: %s", e, exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+@app.post("/api/webhook/daily_summary/repush")
+async def api_webhook_repush_daily_summary(req: WebhookDailySummaryRepushRequest):
+    if not is_live_enabled():
+        return {"status": "error", "msg": "当前为回测模式，手动重复推送仅在实盘模式可用"}
+    try:
+        payload, day_text, err = _resolve_daily_summary_for_manual_repush(req.date)
+        if payload is None:
+            return {"status": "error", "msg": err or "暂无可重推的日终汇总"}
+        stock_codes = payload.get("stock_codes", [])
+        stock_codes = stock_codes if isinstance(stock_codes, list) else []
+        notify_stock_code = "MULTI" if len(stock_codes) != 1 else str(stock_codes[0] or "MULTI")
+        await webhook_notifier.notify(
+            event_type="daily_summary",
+            data=payload,
+            stock_code=notify_stock_code,
+            force=True
+        )
+        return {
+            "status": "success",
+            "msg": f"日终汇总已手动重复推送: {day_text}",
+            "date": day_text,
+            "stock_count": int(payload.get("stock_count", len(stock_codes)) or 0),
+            "stock_codes": stock_codes
+        }
+    except Exception as e:
+        logger.error("manual repush daily_summary failed: %s", e, exc_info=True)
+        return {"status": "error", "msg": str(e)}
+
+def _history_sync_payload_from_request(req: HistorySyncRunRequest):
+    cfg = ConfigLoader.reload()
+    return {
+        "codes": req.codes,
+        "tables": req.tables,
+        "start_time": req.start_time,
+        "end_time": req.end_time,
+        "time_mode": str(req.time_mode or cfg.get("history_sync.time_mode", "lookback") or "lookback"),
+        "custom_start_time": req.custom_start_time or cfg.get("history_sync.custom_start_time", None),
+        "custom_end_time": req.custom_end_time or cfg.get("history_sync.custom_end_time", None),
+        "session_only": bool(req.session_only) if req.session_only is not None else bool(cfg.get("history_sync.session_only", True)),
+        "intraday_mode": bool(req.intraday_mode) if req.intraday_mode is not None else bool(cfg.get("history_sync.intraday_mode", False)),
+        "lookback_days": max(1, int(req.lookback_days or 1)),
+        "max_codes": max(1, int(req.max_codes or 1)),
+        "batch_size": max(1, int(req.batch_size or 1)),
+        "dry_run": bool(req.dry_run),
+        "on_duplicate": str(req.on_duplicate or "ignore"),
+        "write_mode": str(req.write_mode or cfg.get("history_sync.write_mode", "api") or "api"),
+        "direct_db_source": str(req.direct_db_source or cfg.get("history_sync.direct_db_source", "mysql") or "mysql"),
+    }
+
+async def _run_history_sync_once(payload: dict):
+    result = await asyncio.to_thread(history_sync_service.run_sync, payload)
+    logger.info(f"history sync finished: {result.get('status')}")
+    return result
+
+async def _history_sync_scheduler_loop():
+    while True:
+        cfg = ConfigLoader.reload()
+        interval = max(1, int(cfg.get("history_sync.interval_minutes", 60) or 60))
+        payload = {
+            "codes": cfg.get("history_sync.codes", None),
+            "tables": cfg.get("history_sync.tables", list(DEFAULT_SYNC_TABLES)),
+            "start_time": cfg.get("history_sync.start_time", None),
+            "end_time": cfg.get("history_sync.end_time", None),
+            "time_mode": str(cfg.get("history_sync.time_mode", "lookback") or "lookback"),
+            "custom_start_time": cfg.get("history_sync.custom_start_time", None),
+            "custom_end_time": cfg.get("history_sync.custom_end_time", None),
+            "session_only": bool(cfg.get("history_sync.session_only", True)),
+            "intraday_mode": bool(cfg.get("history_sync.intraday_mode", False)),
+            "lookback_days": max(1, int(cfg.get("history_sync.lookback_days", 10) or 10)),
+            "max_codes": max(1, int(cfg.get("history_sync.max_codes", 10000) or 10000)),
+            "batch_size": max(1, int(cfg.get("history_sync.batch_size", 500) or 500)),
+            "dry_run": bool(cfg.get("history_sync.dry_run", False)),
+            "on_duplicate": str(cfg.get("history_sync.on_duplicate", "ignore") or "ignore"),
+            "write_mode": str(cfg.get("history_sync.write_mode", "api") or "api"),
+            "direct_db_source": str(cfg.get("history_sync.direct_db_source", "mysql") or "mysql"),
+        }
+        try:
+            await _run_history_sync_once(payload)
+        except Exception as e:
+            logger.error(f"history sync scheduler failed: {e}", exc_info=True)
+        await asyncio.sleep(interval * 60)
+
+async def _auto_start_live_from_config(cfg=None):
+    global live_capital_plan_mode, live_capital_plan_weights
+    # 统一从当前配置中解析自动实盘启动目标，避免写死标的。
+    c = cfg if cfg is not None else ConfigLoader.reload()
+    codes = _configured_live_codes(c)
+    if not codes:
+        codes = _normalize_live_codes(cfg=c)
+    # 从配置读取自动启动策略范围，确保重启后自动启动时策略配置一致。
+    auto_strategy_ids = c.get("system.live_auto_start_strategy_ids", [])
+    if isinstance(auto_strategy_ids, list) and auto_strategy_ids:
+        selection = {"strategy_ids": [str(x) for x in auto_strategy_ids if str(x).strip()]}
+        for code in codes:
+            live_strategy_profiles[code] = selection
+    total_capital = float(c.get("system.initial_capital", 1000000.0) or 1000000.0)
+    all_target_codes = list(dict.fromkeys(_live_running_codes() + codes))
+    # 沿用现有资金分配机制，确保自动启动与手动启动口径一致。
+    cap_plan, cap_mode, cap_weights = _build_live_capital_plan(
+        codes=all_target_codes,
+        total_capital=total_capital,
+        allocation_mode=live_capital_plan_mode,
+        allocation_weights=live_capital_plan_weights if isinstance(live_capital_plan_weights, dict) else None,
+    )
+    live_capital_plan_mode = cap_mode
+    live_capital_plan_weights = cap_weights
+    for code, cap in cap_plan.items():
+        live_capital_profiles[code] = float(cap)
+    started = []
+    already_running = []
+    for stock_code in codes:
+        task = live_tasks.get(stock_code)
+        if task and not task.done():
+            already_running.append(stock_code)
+            continue
+        live_tasks[stock_code] = asyncio.create_task(run_cabinet_task(stock_code))
+        started.append(stock_code)
+    return started, already_running
+
+def _resolve_live_auto_start_schedule(cfg=None):
+    # 支持从配置动态读取自动实盘开关与时间，避免修改代码才能调整时刻。
+    c = cfg if cfg is not None else ConfigLoader.reload()
+    enabled = bool(c.get("system.live_auto_start_enabled", True))
+    raw_time = str(c.get("system.live_auto_start_time", "09:20") or "09:20").strip()
+    # 仅接受 HH:MM（24小时制），非法值回退默认时间，保证调度器稳态运行。
+    m = re.match(r"^([01]?\d|2[0-3])\s*[:：]\s*([0-5]\d)$", raw_time)
+    if not m:
+        return enabled, 9, 20, "09:20", raw_time
+    hour = int(m.group(1))
+    minute = int(m.group(2))
+    return enabled, hour, minute, f"{hour:02d}:{minute:02d}", raw_time
+
+async def _live_auto_start_scheduler_loop():
+    global live_auto_start_last_trigger_date, live_auto_start_last_invalid_time
+    while True:
+        try:
+            cfg = ConfigLoader.reload()
+            now = datetime.now()
+            today = now.strftime("%Y-%m-%d")
+            enabled, target_hour, target_minute, target_hhmm, raw_time = _resolve_live_auto_start_schedule(cfg)
+            if raw_time and raw_time != target_hhmm:
+                # 非法时间仅在值变化时告警一次，避免高频轮询造成日志刷屏。
+                if live_auto_start_last_invalid_time != raw_time:
+                    logger.warning(
+                        "system.live_auto_start_time invalid=%s, fallback=%s",
+                        raw_time,
+                        target_hhmm,
+                    )
+                    live_auto_start_last_invalid_time = raw_time
+            else:
+                live_auto_start_last_invalid_time = ""
+            # 每日在配置时刻触发一次自动开启（仅 live 模式且启用自动启动时生效）。
+            if (
+                enabled
+                and now.hour == target_hour
+                and now.minute == target_minute
+                and live_auto_start_last_trigger_date != today
+                and _system_mode(cfg) == "live"
+                and bool(cfg.get("system.enable_live", True))
+            ):
+                started, already_running = await _auto_start_live_from_config(cfg)
+                live_auto_start_last_trigger_date = today
+                if started:
+                    await _broadcast_system_and_notify(
+                        f"{target_hhmm} 自动开启实盘：{_format_live_start_summary(started)}",
+                        started,
+                    )
+                else:
+                    await _broadcast_system_and_notify(
+                        f"{target_hhmm} 自动开启实盘检查完成：目标已在运行中 {','.join(already_running)}",
+                        already_running,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("live auto start scheduler failed: %s", e, exc_info=True)
+        # 低频轮询足够覆盖分钟粒度调度，同时降低对主循环的影响。
+        await asyncio.sleep(5)
+
+@app.post("/api/history_sync/run")
+async def api_history_sync_run(req: HistorySyncRunRequest):
+    payload = _history_sync_payload_from_request(req)
+    if req.async_run:
+        asyncio.create_task(_run_history_sync_once(payload))
+        return {"status": "accepted", "msg": "history sync task started", "payload": payload}
+    return await _run_history_sync_once(payload)
+
+@app.get("/api/history_sync/status")
+async def api_history_sync_status():
+    return {
+        "status": "success",
+        "service": history_sync_service.get_status(),
+        "scheduler_running": history_sync_scheduler_task is not None and not history_sync_scheduler_task.done(),
+    }
+
+@app.post("/api/history_sync/stop")
+async def api_history_sync_stop():
+    result = await asyncio.to_thread(history_sync_service.request_stop)
+    return {"status": "success", **result}
+
+@app.get("/api/history_sync/records")
+async def api_history_sync_records(limit: int = 20, offset: int = 0):
+    data = await asyncio.to_thread(history_sync_service.list_records, limit, offset)
+    return {"status": "success", **data}
+
+@app.get("/api/history_sync/records/{run_id}")
+async def api_history_sync_record_detail(run_id: str):
+    record = await asyncio.to_thread(history_sync_service.get_record, run_id)
+    if not isinstance(record, dict):
+        return {"status": "error", "msg": "record not found", "run_id": run_id}
+    return {"status": "success", "record": record}
+
+@app.post("/api/history_sync/scheduler/start")
+async def api_history_sync_scheduler_start(req: HistorySyncScheduleRequest):
+    global history_sync_scheduler_task
+    cfg = ConfigLoader.reload()
+    cfg.set("history_sync.scheduler_enabled", True)
+    cfg.set("history_sync.interval_minutes", max(1, int(req.interval_minutes or 1)))
+    cfg.set("history_sync.lookback_days", max(1, int(req.lookback_days or 1)))
+    cfg.set("history_sync.time_mode", str(req.time_mode or cfg.get("history_sync.time_mode", "lookback") or "lookback"))
+    cfg.set("history_sync.custom_start_time", req.custom_start_time if req.custom_start_time is not None else cfg.get("history_sync.custom_start_time", None))
+    cfg.set("history_sync.custom_end_time", req.custom_end_time if req.custom_end_time is not None else cfg.get("history_sync.custom_end_time", None))
+    cfg.set(
+        "history_sync.session_only",
+        bool(req.session_only) if req.session_only is not None else bool(cfg.get("history_sync.session_only", True)),
+    )
+    cfg.set(
+        "history_sync.intraday_mode",
+        bool(req.intraday_mode) if req.intraday_mode is not None else bool(cfg.get("history_sync.intraday_mode", False)),
+    )
+    cfg.set("history_sync.max_codes", max(1, int(req.max_codes or 1)))
+    cfg.set("history_sync.batch_size", max(1, int(req.batch_size or 1)))
+    cfg.set("history_sync.tables", req.tables if req.tables else list(DEFAULT_SYNC_TABLES))
+    cfg.set("history_sync.dry_run", bool(req.dry_run))
+    cfg.set("history_sync.on_duplicate", str(req.on_duplicate or "ignore"))
+    cfg.set("history_sync.write_mode", str(req.write_mode or "api"))
+    cfg.set("history_sync.direct_db_source", str(req.direct_db_source or "mysql"))
+    cfg.save()
+    if history_sync_scheduler_task is None or history_sync_scheduler_task.done():
+        history_sync_scheduler_task = asyncio.create_task(_history_sync_scheduler_loop())
+    return {
+        "status": "success",
+        "msg": "history sync scheduler started",
+        "scheduler_running": True,
+    }
+
+@app.post("/api/history_sync/scheduler/stop")
+async def api_history_sync_scheduler_stop():
+    global history_sync_scheduler_task
+    cfg = ConfigLoader.reload()
+    cfg.set("history_sync.scheduler_enabled", False)
+    cfg.save()
+    if history_sync_scheduler_task and not history_sync_scheduler_task.done():
+        history_sync_scheduler_task.cancel()
+    return {"status": "success", "msg": "history sync scheduler stopped"}
+
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+        self.connection_queues = {}
+        self.sender_tasks = {}
+        self.queue_maxsize = 20000
+        self.send_timeout_sec = 5.0
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+        q = asyncio.Queue(maxsize=self.queue_maxsize)
+        self.connection_queues[websocket] = q
+        self.sender_tasks[websocket] = asyncio.create_task(self._sender_loop(websocket, q))
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+        task = self.sender_tasks.pop(websocket, None)
+        if task is not None:
+            task.cancel()
+        self.connection_queues.pop(websocket, None)
+
+    async def _sender_loop(self, websocket: WebSocket, q: asyncio.Queue):
+        try:
+            while True:
+                payload = await q.get()
+                try:
+                    await asyncio.wait_for(websocket.send_json(payload), timeout=self.send_timeout_sec)
+                except Exception as e:
+                    print(f"WS Error: {e}")
+                    break
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self.disconnect(websocket)
+
+    async def broadcast(self, message: dict):
+        for connection in list(self.active_connections):
+            q = self.connection_queues.get(connection)
+            if q is None:
+                continue
+            try:
+                q.put_nowait(message)
+            except asyncio.QueueFull:
+                try:
+                    _ = q.get_nowait()
+                    q.put_nowait(message)
+                except Exception:
+                    self.disconnect(connection)
+
+manager = ConnectionManager()
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
+    
+    # Do NOT send strategies immediately. Wait for start_simulation command.
+    
+    try:
+        while True:
+            data = await websocket.receive_text()
+            # Handle commands
+            try:
+                cmd = json.loads(data)
+                if str(cmd.get("type", "")).strip().lower() != "ping":
+                    print(f"Received command: {cmd}")
+                
+                if cmd.get("type") == "reload_strategies":
+                    # Reload the modules dynamically via websocket command
+                    try:
+                        if 'src.strategies.implemented_strategies' in sys.modules:
+                            importlib.reload(sys.modules['src.strategies.implemented_strategies'])
+                        importlib.reload(strategy_factory_module)
+                        strategies = strategy_factory_module.create_strategies()
+                        await manager.broadcast({"type": "system", "data": {"msg": f"策略热更新成功，当前共 {len(strategies)} 个策略"}})
+                    except Exception as e:
+                        await manager.broadcast({"type": "system", "data": {"msg": f"策略热更新失败: {str(e)}"}})
+
+                elif cmd.get("type") == "start_simulation":
+                    if not is_live_enabled():
+                        await manager.broadcast({"type": "system", "data": {"msg": "Live功能已禁用（需 system.mode=live）"}})
+                        continue
+                    if cabinet_task and not cabinet_task.done():
+                        if current_backtest_report and str(current_backtest_report.get("status", "")).lower() == "running":
+                            cancel_current_backtest_report("backtest stopped by live start")
+                        cabinet_task.cancel()
+                        cabinet_task = None
+                    _clear_live_last_error()
+                    replace_existing = bool(cmd.get("replace_existing", True))
+                    codes = _normalize_live_codes(
+                        stock_code=cmd.get("stock"),
+                        stock_codes=cmd.get("stocks")
+                    )
+                    common_selection = _normalize_strategy_selection(strategy_id=cmd.get("strategy"), strategy_ids=cmd.get("strategy_ids"))
+                    stock_strategy_map = _normalize_stock_strategy_map(cmd.get("stock_strategy_map"))
+                    if replace_existing:
+                        await _stop_live_tasks(clear_profile=True)
+                    cfg_live = ConfigLoader.reload()
+                    total_capital = float(cmd.get("total_capital") if cmd.get("total_capital") is not None else (cfg_live.get("system.initial_capital", 1000000.0) or 1000000.0))
+                    all_target_codes = list(codes) if replace_existing else list(dict.fromkeys(_live_running_codes() + codes))
+                    cap_plan, cap_mode, cap_weights = _build_live_capital_plan(
+                        codes=all_target_codes,
+                        total_capital=total_capital,
+                        allocation_mode=cmd.get("allocation_mode"),
+                        allocation_weights=cmd.get("allocation_weights")
+                    )
+                    global live_capital_plan_mode, live_capital_plan_weights
+                    live_capital_plan_mode = cap_mode
+                    live_capital_plan_weights = cap_weights
+                    for code, cap in cap_plan.items():
+                        live_capital_profiles[code] = float(cap)
+                    started = []
+                    already_running = []
+                    for stock_code in codes:
+                        if stock_code in stock_strategy_map:
+                            live_strategy_profiles[stock_code] = stock_strategy_map[stock_code]
+                        elif common_selection is not None:
+                            live_strategy_profiles[stock_code] = common_selection
+                        task = live_tasks.get(stock_code)
+                        if task and not task.done():
+                            already_running.append(stock_code)
+                            continue
+                        live_tasks[stock_code] = asyncio.create_task(run_cabinet_task(stock_code))
+                        started.append(stock_code)
+                    text = (
+                        f"当前实盘已启动：{_format_live_start_summary(started)}"
+                        if started
+                        else f"目标已在运行中: {','.join(already_running)}"
+                    )
+                    await _broadcast_system_and_notify(text, started)
+                
+                elif cmd.get("type") == "start_backtest":
+                    cfg = ConfigLoader.reload()
+                    if _system_mode(cfg) != "backtest":
+                        await manager.broadcast({"type": "system", "data": {"msg": "当前运行模式为 live，已拒绝启动回测，请先切回 backtest"}})
+                        continue
+                    stock_code = cmd.get("stock", _default_target_code(cfg))
+                    strategy_id = cmd.get("strategy", "all")
+                    strategy_ids = cmd.get("strategy_ids")
+                    strategy_mode = cmd.get("strategy_mode")  # e.g., 'top5'
+                    combination_config = cmd.get("combination_config")
+                    start = cmd.get("start")  # 'YYYY-MM-DD'
+                    end = cmd.get("end")      # 'YYYY-MM-DD'
+                    capital = cmd.get("capital")  # numeric
+                    
+                    if cabinet_task and not cabinet_task.done():
+                        if current_backtest_report and str(current_backtest_report.get("status", "")).lower() == "running":
+                            cancel_current_backtest_report("backtest replaced by new request")
+                        cabinet_task.cancel()
+                        cabinet_task = None
+                    if _live_running_codes():
+                        await _stop_live_tasks()
+                    report_id = start_new_backtest_report(stock_code, strategy_id, {
+                        "stock_code": stock_code,
+                        "strategy_id": strategy_id,
+                        "strategy_ids": strategy_ids,
+                        "strategy_mode": strategy_mode,
+                        "combination_config": combination_config,
+                        "start": start,
+                        "end": end,
+                        "capital": capital
+                    })
+
+                    _spawn_backtest_task(
+                        stock_code,
+                        strategy_id,
+                        strategy_mode,
+                        start,
+                        end,
+                        capital,
+                        strategy_ids,
+                        combination_config,
+                        report_id,
+                    )
+
+                elif cmd.get("type") == "ping":
+                    await websocket.send_json({
+                        "type": "pong",
+                        "data": {
+                            "ts": cmd.get("ts"),
+                            "server_ts": datetime.now().isoformat(timespec="seconds")
+                        }
+                    })
+                
+                elif cmd.get("type") == "switch_strategy":
+                    selected = _normalize_strategy_selection(strategy_id=cmd.get("id"), strategy_ids=cmd.get("ids"))
+                    print(f"Switching to strategy: {selected}")
+                    per_stock_selection = _normalize_stock_strategy_map(cmd.get("stock_strategy_map"))
+                    target_codes = _normalize_live_codes(stock_codes=cmd.get("stocks"), use_default=False) if isinstance(cmd.get("stocks"), list) else list(live_cabinets.keys())
+                    for code, pick in per_stock_selection.items():
+                        live_strategy_profiles[code] = pick
+                        cab = live_cabinets.get(code)
+                        if cab:
+                            cab.set_active_strategies(pick)
+                    if selected is not None:
+                        for code in target_codes:
+                            live_strategy_profiles[code] = selected
+                            cab = live_cabinets.get(code)
+                            if cab:
+                                cab.set_active_strategies(selected)
+                        if current_cabinet and (not target_codes):
+                            current_cabinet.set_active_strategies(selected)
+                            code = str(getattr(current_cabinet, "stock_code", "") or "").upper()
+                            if code:
+                                live_strategy_profiles[code] = selected
+                
+                elif cmd.get("type") == "stop_simulation":
+                    stop_codes = cmd.get("stocks")
+                    if isinstance(stop_codes, list) and stop_codes:
+                        stopped = await _stop_live_tasks(stop_codes, clear_profile=True)
+                    else:
+                        stopped = await _stop_live_tasks(clear_profile=True)
+                    if stopped:
+                        await manager.broadcast({"type": "system", "data": {"msg": f"内阁监控已手动停止: {','.join(stopped)}"}})
+                
+                elif cmd.get("type") == "stop_backtest":
+                    if cabinet_task and not cabinet_task.done():
+                        print("Stopping Backtest Task...")
+                        cabinet_task.cancel()
+                        if current_backtest_report and str(current_backtest_report.get("status", "")).lower() == "running":
+                            cancel_current_backtest_report("backtest task cancelled by user")
+                        cabinet_task = None
+                        await manager.broadcast({"type": "system", "data": {"msg": "回测已手动终止"}})
+                    
+            except Exception as e:
+                print(f"Command Error: {e}")
+                
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception:
+        manager.disconnect(websocket)
+    finally:
+        manager.disconnect(websocket)
+
+async def run_cabinet_task(stock_code):
+    """Wrapper to run cabinet live loop"""
+    global current_cabinet
+    if not is_live_enabled():
+        await manager.broadcast({"type": "system", "data": {"msg": "Live功能已在配置中关闭，无法启动监控"}})
+        return
+    print(f"Starting Cabinet Task for {stock_code}")
+    
+    # Reload config
+    config = ConfigLoader.reload()
+    
+    # Initialize
+    global current_provider_source
+    provider_source = current_provider_source or config.get("data_provider.source", "default")
+    current_provider_source = provider_source
+    
+    async def _callback(event_type, data):
+        await emit_event_to_ws(event_type, data, stock_code=stock_code)
+
+    profile = live_strategy_profiles.get(stock_code)
+    init_strategy_ids = None
+    if isinstance(profile, list):
+        init_strategy_ids = [str(x).strip() for x in profile if str(x).strip()]
+    elif str(profile or "").strip() and str(profile).strip().lower() != "all":
+        init_strategy_ids = [str(profile).strip()]
+    init_capital = float(live_capital_profiles.get(stock_code, config.get("system.initial_capital", 1000000.0)) or 0.0)
+    cab = LiveCabinet(
+        stock_code=stock_code,
+        initial_capital=init_capital,
+        provider_type=provider_source,
+        event_callback=_callback,
+        strategy_ids=init_strategy_ids
+    )
+    if profile is not None:
+        cab.set_active_strategies(profile)
+    live_cabinets[stock_code] = cab
+    current_cabinet = cab
+    
+    try:
+        await cab.run_live()
+    except asyncio.CancelledError:
+        print("Cabinet Task Cancelled")
+    except Exception as e:
+        _set_live_last_error(stock_code=stock_code, stage="run_cabinet_task", err=e, tb_text=traceback.format_exc())
+        logger.error("run_cabinet_task failed stock=%s err=%s", stock_code, e, exc_info=True)
+        await manager.broadcast({"type": "system", "data": {"msg": f"实盘任务异常退出 {stock_code}: {e}"}})
+    finally:
+        try:
+            cab._persist_virtual_fund_pool()
+        except Exception:
+            pass
+        live_tasks.pop(stock_code, None)
+        live_cabinets.pop(stock_code, None)
+        if current_cabinet is cab:
+            current_cabinet = next(iter(live_cabinets.values()), None)
+
+async def run_backtest_task(
+    stock_code,
+    strategy_id,
+    strategy_mode=None,
+    start=None,
+    end=None,
+    capital=None,
+    strategy_ids=None,
+    combination_config=None,
+    report_id=None,
+    realtime_push=True,
+    provider_override=None,
+    provider_source_override=None,
+):
+    """Wrapper to run backtest"""
+    logger.info(
+        "Starting Backtest params: stock_code=%s strategy_id=%s strategy_ids=%s strategy_mode=%s combination=%s start=%s end=%s capital=%s realtime_push=%s",
+        stock_code,
+        strategy_id,
+        strategy_ids,
+        strategy_mode,
+        combination_config,
+        start,
+        end,
+        capital,
+        realtime_push,
+    )
+    emit_to_frontend = bool(realtime_push)
+    if provider_override is None:
+        precheck_ok, precheck_source, precheck_reason = await _run_backtest_provider_precheck(
+            stock_code=stock_code,
+            start=start,
+            end=end,
+            broadcast_ws=emit_to_frontend,
+        )
+        if not precheck_ok:
+            fail_current_backtest_report(f"backtest precheck failed source={precheck_source} reason={precheck_reason}")
+            return
+    await _maybe_prefetch_fundamental_before_backtest(stock_code=stock_code, emit_to_frontend=emit_to_frontend)
+    baseline_result = apply_backtest_baseline(
+        stock_code=stock_code,
+        strategy_id=strategy_id,
+        strategy_mode=strategy_mode,
+        strategy_ids=strategy_ids
+    )
+    cfg = ConfigLoader.reload()
+    if baseline_result.get("applied"):
+        profile_name = baseline_result.get("profile_name", "")
+        msg = (
+            f"已应用回测基线Profile={profile_name} "
+            f"market={baseline_result.get('market', '')} "
+            f"adj={baseline_result.get('adjustment_mode', '')} "
+            f"settlement={baseline_result.get('settlement_rule', '')} "
+            f"source={baseline_result.get('data_source', '')}"
+        )
+        if emit_to_frontend:
+            await manager.broadcast({"type": "system", "data": {"msg": msg}})
+    initial_capital = float(capital) if capital is not None else float(cfg.get("system.initial_capital", 1000000.0) or 1000000.0)
+
+    task_report_id = str(report_id or "").strip()
+    async def _emit_event_scoped(event_type, data, stock_code=None):
+        await emit_event_to_ws(event_type, data, stock_code=stock_code, report_id=task_report_id, broadcast_ws=emit_to_frontend)
+    cab = BacktestCabinet(
+        stock_code=stock_code,
+        strategy_id=strategy_id,
+        initial_capital=initial_capital,
+        event_callback=_emit_event_scoped,
+        strategy_mode=strategy_mode,
+        strategy_ids=strategy_ids,
+        combination_config=combination_config,
+        provider_override=provider_override,
+        provider_source_override=provider_source_override,
+    )
+
+    try:
+        from datetime import datetime
+        start_dt = None
+        end_dt = None
+        if start:
+            start_dt = datetime.strptime(start, "%Y-%m-%d")
+        if end:
+            end_dt = datetime.strptime(end, "%Y-%m-%d")
+        await cab.run(start_date=start_dt, end_date=end_dt)
+        if _is_active_backtest_report(task_report_id) and current_backtest_report.get("status") == "running" and not current_backtest_report.get("summary"):
+            fail_current_backtest_report("backtest finished without report summary")
+    except asyncio.CancelledError:
+        print("Backtest Task Cancelled")
+        if _is_active_backtest_report(task_report_id) and str(current_backtest_report.get("status", "")).lower() == "running":
+            cancel_current_backtest_report("backtest task cancelled")
+    except Exception as e:
+        logger.error(f"run_backtest_task failed: {e}", exc_info=True)
+        if _is_active_backtest_report(task_report_id):
+            fail_current_backtest_report(str(e))
+
+async def emit_event_to_ws(event_type, data, stock_code=None, report_id=None, broadcast_ws=True):
+    global latest_backtest_result, latest_strategy_reports, current_backtest_report, current_backtest_progress, current_backtest_trades
+    scoped_report_id = str(report_id or "").strip()
+    if scoped_report_id and str(event_type or "").startswith("backtest_"):
+        if not _is_active_backtest_report(scoped_report_id):
+            return
+    emit_data = data
+    if stock_code:
+        if isinstance(data, dict):
+            emit_data = dict(data)
+            emit_data["stock_code"] = stock_code
+    attach_profile = False
+    et = str(event_type or "").strip().lower()
+    if et.startswith("backtest_"):
+        attach_profile = True
+    elif et in {"live_alert", "live_monitor_snapshot", "daily_summary"}:
+        attach_profile = True
+    if attach_profile:
+        emit_data = await _try_attach_fundamental_profile(event_type, emit_data, stock_code)
+    if event_type == "backtest_result":
+        latest_backtest_result = emit_data
+        _invalidate_backtest_kline_payload_cache()
+        if current_backtest_report is not None:
+            current_backtest_report["summary"] = emit_data
+            current_backtest_report["ranking"] = emit_data.get("ranking", [])
+            if isinstance(emit_data, dict) and isinstance(emit_data.get("fundamental_profile"), dict):
+                current_backtest_report["fundamental_profile"] = emit_data.get("fundamental_profile")
+            current_backtest_report["status"] = "success"
+            current_backtest_report["error_msg"] = None
+            current_backtest_report["finished_at"] = datetime.now().isoformat(timespec="seconds")
+            finalize_current_backtest_report()
+        current_backtest_progress = {"progress": 100, "current_date": "Done"}
+    elif event_type == "backtest_progress":
+        current_backtest_progress = emit_data
+        if isinstance(emit_data, dict) and str(emit_data.get("phase", "")).lower() == "data_fetch":
+            logger.info(
+                "BacktestDataFetch progress=%s phase_label=%s current_date=%s",
+                emit_data.get("progress"),
+                emit_data.get("phase_label"),
+                emit_data.get("current_date"),
+            )
+    elif event_type == "backtest_failed":
+        msg = emit_data.get("msg") if isinstance(emit_data, dict) else str(emit_data)
+        fail_current_backtest_report(msg)
+        _invalidate_backtest_kline_payload_cache()
+        current_backtest_progress = {"progress": current_backtest_progress.get("progress", 0), "current_date": "Failed"}
+    elif event_type == "backtest_strategy_report":
+        sid = str(emit_data.get("strategy_id", ""))
+        if sid:
+            latest_strategy_reports[sid] = emit_data
+            if current_backtest_report is not None:
+                current_backtest_report["strategy_reports"][sid] = emit_data
+    elif event_type == "backtest_trade":
+        if isinstance(emit_data, dict):
+            current_backtest_trades.append({
+                "dt": str(emit_data.get("dt", "")),
+                "strategy": str(emit_data.get("strategy", "")),
+                "code": str(emit_data.get("code", "")),
+                "dir": str(emit_data.get("dir", "")),
+                "price": float(emit_data.get("price", 0.0) or 0.0),
+                "qty": int(emit_data.get("qty", 0) or 0)
+            })
+            _invalidate_backtest_kline_payload_cache(stock_code=emit_data.get("code", ""))
+    elif event_type == "backtest_flow":
+        if isinstance(emit_data, dict) and str(emit_data.get("module", "")).strip() == "工部":
+            flow_msg = str(emit_data.get("msg", "") or "").strip()
+            if flow_msg:
+                logger.info("BacktestDataFetch flow=%s", flow_msg)
+    elif event_type == "live_auto_stop":
+        auto_msg = ""
+        if isinstance(emit_data, dict):
+            auto_msg = str(emit_data.get("msg", "") or "").strip()
+        if not auto_msg:
+            auto_msg = "已超过15:30，自动关闭实盘模式"
+        stopped_live = await _stop_live_tasks(clear_profile=True)
+        if isinstance(emit_data, dict):
+            emit_data = dict(emit_data)
+            emit_data["stopped_live_codes"] = stopped_live
+        await _broadcast_system_and_notify(
+            f"{auto_msg}（已停止: {','.join(stopped_live) if stopped_live else '无运行任务'}）",
+            stopped_live
+        )
+    payload = {
+        "type": event_type,
+        "data": emit_data,
+        "server_time": datetime.now().isoformat(timespec="seconds")
+    }
+    if stock_code:
+        payload["stock_code"] = stock_code
+    if broadcast_ws and _allow_ws_emit(event_type):
+        await manager.broadcast(payload)
+    if stock_code and event_type != "system":
+        if event_type == "daily_summary":
+            await _notify_daily_summary_once(stock_code=stock_code, data=emit_data)
+        elif event_type not in _WS_SKIP_WEBHOOK_EVENT_TYPES and _should_notify_webhook_by_category(event_type=event_type, data=emit_data):
+            asyncio.create_task(webhook_notifier.notify(event_type=event_type, data=emit_data, stock_code=stock_code))
+
+async def _broadcast_system_and_notify(msg: str, stock_codes=None):
+    text = str(msg or "").strip()
+    if not text:
+        return
+    await manager.broadcast({
+        "type": "system",
+        "data": {"msg": text},
+        "server_time": datetime.now().isoformat(timespec="seconds")
+    })
+    codes = []
+    if isinstance(stock_codes, (list, tuple, set)):
+        for item in stock_codes:
+            code = str(item or "").strip().upper()
+            if code and code not in codes:
+                codes.append(code)
+    notify_data = {"msg": text}
+    if codes:
+        notify_data["stock_codes"] = codes
+    notify_stock_code = codes[0] if len(codes) == 1 else "MULTI"
+    if _should_notify_webhook_by_category(event_type="system", data=notify_data):
+        await webhook_notifier.notify(event_type="system", data=notify_data, stock_code=notify_stock_code)
+
+async def startup_event():
+    global history_sync_scheduler_task, startup_server_host, startup_server_port, evolution_ws_pump_task, live_auto_start_scheduler_task
+    _apply_log_level()
+    logging.getLogger("uvicorn.access").addFilter(_UvicornAccessPathFilter())
+    logger.info("Initializing Cabinet Server...")
+    load_report_history()
+    _ensure_pattern_thumb_warmup_task()
+    
+    # Log registered routes
+    logger.info("--- Registered API Endpoints ---")
+    for route in app.routes:
+        if hasattr(route, "methods"):
+            logger.info(f"{route.methods} {route.path}")
+    logger.info("--------------------------------")
+    
+    strategies = strategy_factory_module.create_strategies()
+    logger.info(f"Loaded {len(strategies)} Strategies: {[s.name for s in strategies]}")
+    cfg = ConfigLoader.reload()
+    _startup_private_data_check(cfg)
+    if bool(cfg.get("history_sync.scheduler_enabled", False)):
+        history_sync_scheduler_task = asyncio.create_task(_history_sync_scheduler_loop())
+    if live_auto_start_scheduler_task is None or live_auto_start_scheduler_task.done():
+        # 自动实盘启动调度器始终常驻，由运行模式决定是否触发。
+        live_auto_start_scheduler_task = asyncio.create_task(_live_auto_start_scheduler_loop())
+    evolution_runtime.set_event_sink(_push_evolution_ws_event)
+    evolution_platform_hub.set_event_sink(_push_evolution_ws_event)
+    evolution_platform_hub.start_services(auto_backup=bool(cfg.get("evolution.platform.auto_backup_enabled", False)))
+    if evolution_ws_pump_task is None or evolution_ws_pump_task.done():
+        evolution_ws_pump_task = asyncio.create_task(_evolution_ws_pump_loop())
+    server_host = startup_server_host if startup_server_host else _server_host(cfg)
+    server_port = startup_server_port if startup_server_port else _server_port(cfg)
+    access_host = "localhost" if server_host in {"0.0.0.0", "::"} else server_host
+    logger.info(f"Server Started. Access dashboard at http://{access_host}:{server_port}")
+
+async def shutdown_event():
+    global history_sync_scheduler_task, evolution_ws_pump_task, live_auto_start_scheduler_task
+    if not str(SERVER_SHUTDOWN_CONTEXT.get("reason", "") or "").strip():
+        _mark_server_shutdown_reason(reason="shutdown_event", detail="lifecycle shutdown event", origin="fastapi", overwrite=True)
+    logger.warning(
+        "Shutdown event triggered reason=%s detail=%s origin=%s signal=%s cabinet_running=%s live_codes=%s history_sync_running=%s live_auto_start_running=%s evolution_running=%s",
+        SERVER_SHUTDOWN_CONTEXT.get("reason", ""),
+        SERVER_SHUTDOWN_CONTEXT.get("detail", ""),
+        SERVER_SHUTDOWN_CONTEXT.get("origin", ""),
+        SERVER_SHUTDOWN_CONTEXT.get("signal", ""),
+        bool(cabinet_task and not cabinet_task.done()) if cabinet_task is not None else False,
+        _live_running_codes(),
+        bool(history_sync_scheduler_task and not history_sync_scheduler_task.done()) if history_sync_scheduler_task is not None else False,
+        bool(live_auto_start_scheduler_task and not live_auto_start_scheduler_task.done()) if live_auto_start_scheduler_task is not None else False,
+        bool(evolution_runtime.status().get("running", False)),
+    )
+    if cabinet_task:
+        cabinet_task.cancel()
+    if _live_running_codes():
+        await _stop_live_tasks()
+    if history_sync_scheduler_task and not history_sync_scheduler_task.done():
+        history_sync_scheduler_task.cancel()
+    if live_auto_start_scheduler_task and not live_auto_start_scheduler_task.done():
+        live_auto_start_scheduler_task.cancel()
+    evolution_runtime.set_event_sink(None)
+    evolution_runtime.stop()
+    await evolution_platform_hub.stop_services()
+    if evolution_ws_pump_task and not evolution_ws_pump_task.done():
+        evolution_ws_pump_task.cancel()
+
+if __name__ == "__main__":
+    import uvicorn
+    _install_server_signal_handlers()
+    cfg = ConfigLoader.reload()
+    server_host, server_port = _resolve_server_bind(cfg)
+    startup_server_host = server_host
+    startup_server_port = server_port
+    try:
+        uvicorn.run(
+            app,
+            host=server_host,
+            port=server_port,
+            ws_ping_interval=20.0,
+            ws_ping_timeout=180.0,
+            ws_max_queue=1024
+        )
+    except KeyboardInterrupt as e:
+        _mark_server_shutdown_reason(
+            reason="keyboard_interrupt",
+            detail=str(e or "KeyboardInterrupt"),
+            origin="main",
+            signal_name=str(SERVER_SHUTDOWN_CONTEXT.get("signal", "") or ""),
+        )
+        logger.warning("Server interrupted by keyboard input: %s", e or "KeyboardInterrupt")
+    except BaseException as e:
+        _mark_server_shutdown_reason(
+            reason="fatal_exception",
+            detail=f"{type(e).__name__}: {e}",
+            origin="main",
+            overwrite=True,
+        )
+        logger.error("Server stopped by unhandled exception", exc_info=True)
+        raise
+    finally:
+        logger.warning(
+            "Server process exiting reason=%s detail=%s origin=%s signal=%s updated_at=%s",
+            SERVER_SHUTDOWN_CONTEXT.get("reason", ""),
+            SERVER_SHUTDOWN_CONTEXT.get("detail", ""),
+            SERVER_SHUTDOWN_CONTEXT.get("origin", ""),
+            SERVER_SHUTDOWN_CONTEXT.get("signal", ""),
+            SERVER_SHUTDOWN_CONTEXT.get("updated_at"),
+        )

@@ -1,0 +1,1225 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>回测报告中心</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        @keyframes fadeSlideIn {
+            from { opacity: 0; transform: translateY(8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        .enter-anim {
+            animation: fadeSlideIn .22s ease-out;
+        }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+    <div class="w-full max-w-none mx-auto px-2 sm:px-3 xl:px-4 2xl:px-5 py-3 sm:py-5">
+        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4 sm:mb-6">
+            <h1 class="text-2xl font-bold"><i class="fa-solid fa-chart-line text-blue-400 mr-2"></i>回测报告中心</h1>
+            <div class="flex items-center gap-2 w-full sm:w-auto flex-wrap">
+                <button id="refresh-btn" class="text-sm bg-blue-700 hover:bg-blue-600 px-3 py-2 rounded border border-blue-600 w-[32%] sm:w-auto whitespace-nowrap transition-all duration-200 hover:-translate-y-0.5 active:scale-95">刷新报告</button>
+                <a id="fundamental-config-link" href="/?open=config" class="text-sm bg-emerald-700 hover:bg-emerald-600 px-3 py-2 rounded border border-emerald-600 text-center w-[32%] sm:w-auto whitespace-nowrap transition-all duration-200 hover:-translate-y-0.5 active:scale-95">前往配置</a>
+                <a id="return-console-btn" href="/" class="text-sm bg-slate-800 hover:bg-slate-700 px-3 py-2 rounded border border-slate-700 text-center w-[32%] sm:w-auto whitespace-nowrap transition-all duration-200 hover:-translate-y-0.5 active:scale-95">返回控制台</a>
+            </div>
+        </div>
+
+        <div class="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] gap-3 xl:gap-4 items-start">
+            <div class="xl:sticky xl:top-3 self-start">
+                <div class="bg-slate-900/60 border border-slate-800 rounded-lg p-3">
+                    <div class="text-lg font-semibold mb-3">历史回测记录</div>
+                    <div id="history-list" class="space-y-2 max-h-[38vh] xl:max-h-[calc(100vh-5.5rem)] overflow-auto"></div>
+                </div>
+            </div>
+
+            <div class="min-w-0 space-y-3 sm:space-y-4">
+                <div id="summary-card" class="bg-slate-900/60 border border-slate-800 rounded-lg p-3 hidden"></div>
+                <div id="insight-card" class="bg-slate-900/60 border border-slate-800 rounded-lg p-3 hidden"></div>
+                <div id="fundamental-readonly-card" class="bg-slate-900/60 border border-slate-800 rounded-lg p-3 hidden"></div>
+                <div id="ai-review-card" class="bg-slate-900/60 border border-slate-800 rounded-lg p-3 hidden"></div>
+                <div id="buffett-review-card" class="bg-slate-900/60 border border-slate-800 rounded-lg p-3 hidden"></div>
+
+                <div class="bg-slate-900/60 border border-slate-800 rounded-lg p-3">
+                    <div class="text-lg font-semibold mb-3">多策略业绩对比</div>
+                    <div id="ranking-mobile" class="md:hidden space-y-2"></div>
+                    <div class="hidden md:block overflow-x-auto">
+                        <table class="w-full text-sm">
+                            <thead class="text-slate-400 bg-slate-800/70">
+                                <tr>
+                                    <th class="px-3 py-2 text-left">排名</th>
+                                    <th class="px-3 py-2 text-left">策略ID</th>
+                                    <th class="px-3 py-2 text-left">使用周期</th>
+                                    <th class="px-3 py-2 text-left">评级</th>
+                                    <th class="px-3 py-2 text-left">评分</th>
+                                    <th class="px-3 py-2 text-left">年化收益</th>
+                                    <th class="px-3 py-2 text-left">最大回撤</th>
+                                    <th class="px-3 py-2 text-left">胜率</th>
+                                    <th class="px-3 py-2 text-left">卡玛</th>
+                                    <th class="px-3 py-2 text-left">报告</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ranking-body" class="divide-y divide-slate-800"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="bg-slate-900/60 border border-slate-800 rounded-lg p-3">
+                    <div class="text-lg font-semibold mb-3">单策略回测报告</div>
+                    <div id="strategy-report-list" class="grid grid-cols-1 2xl:grid-cols-2 gap-3"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    <div id="trade-detail-modal" class="fixed inset-0 bg-black/60 hidden z-50 items-center justify-center p-4">
+        <div class="w-full max-w-5xl bg-slate-900 border border-slate-700 rounded-lg shadow-2xl overflow-hidden">
+            <div class="flex items-center justify-between px-4 py-3 border-b border-slate-700">
+                <div class="text-white font-semibold text-base" id="trade-detail-title">交易明细</div>
+                <button id="trade-detail-close-btn" class="text-slate-400 hover:text-white text-lg leading-none">×</button>
+            </div>
+            <div class="max-h-[70vh] overflow-auto">
+                <table class="w-full text-sm">
+                    <thead class="text-slate-400 bg-slate-800/80 sticky top-0">
+                        <tr>
+                            <th class="px-3 py-2 text-left">时间</th>
+                            <th class="px-3 py-2 text-left">方向</th>
+                            <th class="px-3 py-2 text-right">价格</th>
+                            <th class="px-3 py-2 text-right">数量</th>
+                            <th class="px-3 py-2 text-right">成交额</th>
+                            <th class="px-3 py-2 text-right">费用</th>
+                            <th class="px-3 py-2 text-left">说明</th>
+                            <th class="px-3 py-2 text-right">已实现盈亏</th>
+                        </tr>
+                    </thead>
+                    <tbody id="trade-detail-body" class="divide-y divide-slate-800"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    <div id="report-kline-modal" class="fixed inset-0 bg-black/70 hidden z-50 items-center justify-center p-4">
+        <div class="w-full max-w-6xl h-[86vh] bg-slate-900 border border-slate-700 rounded-lg shadow-2xl overflow-hidden flex flex-col">
+            <div class="flex items-center justify-between px-4 py-3 border-b border-slate-700">
+                <div class="text-white font-semibold text-base" id="report-kline-title">单策略K线</div>
+                <button id="report-kline-close-btn" class="text-slate-400 hover:text-white text-lg leading-none">×</button>
+            </div>
+            <div id="report-kline-subtitle" class="px-4 py-2 text-xs text-slate-400 border-b border-slate-700">--</div>
+            <div class="relative flex-1 bg-slate-950 overflow-hidden">
+                <div id="report-kline-chart" class="w-full h-full"></div>
+                <div id="report-kline-loading" class="hidden absolute inset-0 z-20 bg-slate-950/80 flex items-center justify-center">
+                    <div class="flex items-center gap-2 text-slate-200 text-sm">
+                        <i class="fa-solid fa-spinner fa-spin text-cyan-300"></i>
+                        <span id="report-kline-loading-text">K线加载中...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let currentReportId = null;
+        const strategyReportMap = {};
+        let reportKlineChart = null;
+        let reportKlineCandleSeries = null;
+        let reportKlineVolumeSeries = null;
+        let reportKlineLoadingShownAt = 0;
+        const reportKlinePayloadCache = {};
+        const reportRadarCharts = {};
+        let strategyMetaLoaded = false;
+        let aiReviewLoading = false;
+        let aiReviewLoadingReportId = null;
+        const aiReviewStateMap = {};
+        let buffettReviewLoading = false;
+        let buffettReviewLoadingReportId = null;
+        const buffettReviewStateMap = {};
+        let lastReportSummary = null;
+        let lastReportRanking = [];
+        let lastReportStrategyReports = [];
+        let lastConsistencySummary = null;
+        const STRATEGY_NAME_MAP = {
+            "00": "长期持有一次硅基",
+            "01": "三周期共振波段",
+            "02": "短线弱转强烂板",
+            "03": "ETF行业轮动",
+            "04": "龙头首阴反包",
+            "05": "3N法则主升浪",
+            "06": "海豚交易法",
+            "07": "跳空交易系统",
+            "08": "神奇九转",
+            "09": "箱体降本策略"
+        };
+        const STRATEGY_PERIOD_MAP = {
+            "00": "日线",
+            "01": "60分钟",
+            "02": "1分钟",
+            "03": "日线",
+            "04": "日线",
+            "05": "30分钟",
+            "06": "1分钟",
+            "07": "15分钟",
+            "08": "1分钟",
+            "09": "日线"
+        };
+
+        function periodLabelFromKlineType(v) {
+            const tf = String(v || '').trim().toLowerCase();
+            if (!tf) return '--';
+            if (['d', '1d', 'day', 'daily'].includes(tf)) return '日线';
+            if (tf.endsWith('min')) return `${tf.replace('min', '')}分钟`;
+            return tf;
+        }
+
+        function renderMarkdownHtml(mdText) {
+            const src = String(mdText || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            if (window.marked && typeof window.marked.parse === 'function') {
+                return window.marked.parse(src);
+            }
+            return `<pre class="whitespace-pre-wrap text-sm leading-7 text-slate-200">${src}</pre>`;
+        }
+
+        function renderFundamentalReadonly(profile = null) {
+            const card = document.getElementById('fundamental-readonly-card');
+            if (!card) return;
+            const p = (profile && typeof profile === 'object') ? profile : {};
+            const status = String(p.status || '').trim();
+            const cache = (p.cache && typeof p.cache === 'object') ? p.cache : {};
+            const hit = Boolean(cache.hit);
+            const interfaces = Array.isArray(p.interfaces_enabled) ? p.interfaces_enabled : [];
+            const warnings = Array.isArray(p.warnings) ? p.warnings.filter(Boolean).slice(0, 3) : [];
+            const summary = (p.summary && typeof p.summary === 'object') ? p.summary : {};
+            const company = (summary.company_profile && typeof summary.company_profile === 'object') ? summary.company_profile : {};
+            if (!status) {
+                card.classList.remove('hidden');
+                card.innerHTML = `
+                    <div class="text-lg font-semibold text-white mb-2">基本面适配器（只读）</div>
+                    <div class="text-sm text-slate-300">当前报告无基本面画像数据，配置后在下一次回测生效。</div>
+                    <a href="/?open=config" class="inline-block mt-3 text-xs bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded border border-emerald-600">前往配置中心</a>
+                `;
+                return;
+            }
+            card.classList.remove('hidden');
+            card.innerHTML = `
+                <div class="text-lg font-semibold text-white mb-2">基本面适配器（只读）</div>
+                <div class="text-sm text-slate-300 leading-7">
+                    状态：<span class="text-cyan-300 font-semibold">${status}</span>
+                    ${hit ? '<span class="text-xs text-slate-500 ml-2">(缓存)</span>' : ''}
+                    <br>
+                    标的：<span class="font-mono text-white">${String(p.stock_code || '--')}</span>
+                    · 公司：<span class="text-white">${String(company.name || '--')}</span>
+                    · 行业：<span class="text-white">${String(company.industry || '--')}</span>
+                    <br>
+                    已启用接口：<span class="text-emerald-300">${interfaces.length}</span>${interfaces.length ? `（${interfaces.join(', ')}）` : ''}
+                    ${warnings.length ? `<br>告警：<span class="text-amber-300">${warnings.join('；')}</span>` : ''}
+                </div>
+                <a href="/?open=config" class="inline-block mt-3 text-xs bg-emerald-700 hover:bg-emerald-600 text-white px-3 py-1.5 rounded border border-emerald-600">前往配置中心</a>
+            `;
+        }
+
+        function renderReviewList(items = [], emptyText = '--') {
+            const rows = Array.isArray(items) ? items.map(x => String(x || '').trim()).filter(Boolean) : [];
+            if (!rows.length) return `<div class="text-slate-500 text-xs">${emptyText}</div>`;
+            return `<ul class="list-disc pl-5 space-y-1 text-slate-200 text-xs">${rows.map((x) => `<li>${x}</li>`).join('')}</ul>`;
+        }
+
+        function renderReviewMetricGrid(items = []) {
+            const rows = Array.isArray(items) ? items : [];
+            if (!rows.length) return '';
+            return `<div class="grid grid-cols-1 md:grid-cols-2 gap-2 mt-3">${rows.map((item) => `
+                <div class="rounded border border-slate-700 bg-slate-950/60 px-3 py-2 text-xs">
+                    <div class="text-slate-400">${String(item.label || '--')}</div>
+                    <div class="text-slate-100 mt-1">${String(item.value || '--')}</div>
+                </div>
+            `).join('')}</div>`;
+        }
+
+        function renderReviewVerdictBadge(verdict = '', kind = 'ai') {
+            const text = String(verdict || '').trim();
+            if (!text) return '';
+            const upper = text.toUpperCase();
+            let tone = 'slate';
+            if (kind === 'buffett') {
+                if (upper === 'BUY' || upper === 'HOLD') tone = 'yellow';
+                else if (upper === 'WATCH') tone = 'cyan';
+                else if (upper === 'AVOID') tone = 'rose';
+            } else {
+                if (upper === 'POSITIVE') tone = 'yellow';
+                else if (upper === 'NEUTRAL') tone = 'cyan';
+                else if (upper === 'NEGATIVE') tone = 'rose';
+            }
+            return `<span class="px-2 py-1 rounded-full border text-xs ${badgeClassByTone(tone)}">${text}</span>`;
+        }
+
+        function normalizeAiReviewSummary(summary = {}) {
+            const src = (summary && typeof summary === 'object') ? summary : {};
+            return {
+                title: String(src.title || '').trim(),
+                verdict: String(src.verdict || '').trim(),
+                score: src.score,
+                highlights: Array.isArray(src.highlights) ? src.highlights.map(x => String(x || '').trim()).filter(Boolean) : [],
+                risks: Array.isArray(src.risks) ? src.risks.map(x => String(x || '').trim()).filter(Boolean) : [],
+                buyPoints: Array.isArray(src.buy_points) ? src.buy_points.filter(x => x && typeof x === 'object') : [],
+                sellPoints: Array.isArray(src.sell_points) ? src.sell_points.filter(x => x && typeof x === 'object') : [],
+                parameterSuggestions: Array.isArray(src.parameter_suggestions) ? src.parameter_suggestions.filter(x => x && typeof x === 'object') : [],
+                nextExperiments: Array.isArray(src.next_experiments) ? src.next_experiments.filter(x => x && typeof x === 'object') : [],
+                source: String(src.source || '').trim(),
+            };
+        }
+
+        function normalizeBuffettReviewSummary(summary = {}) {
+            const src = (summary && typeof summary === 'object') ? summary : {};
+            return {
+                title: String(src.title || '').trim(),
+                verdict: String(src.verdict || '').trim(),
+                circleOfCompetence: String(src.circle_of_competence || '').trim(),
+                keyAssumptions: Array.isArray(src.key_assumptions) ? src.key_assumptions.map(x => String(x || '').trim()).filter(Boolean) : [],
+                qualityAssessment: Array.isArray(src.quality_assessment) ? src.quality_assessment.map(x => String(x || '').trim()).filter(Boolean) : [],
+                marginOfSafety: Array.isArray(src.margin_of_safety) ? src.margin_of_safety.map(x => String(x || '').trim()).filter(Boolean) : [],
+                sellChecklist: Array.isArray(src.sell_checklist) ? src.sell_checklist.filter(x => x && typeof x === 'object') : [],
+                topRisks: Array.isArray(src.top_risks) ? src.top_risks.map(x => String(x || '').trim()).filter(Boolean) : [],
+                monitoringMetrics: Array.isArray(src.monitoring_metrics) ? src.monitoring_metrics.map(x => String(x || '').trim()).filter(Boolean) : [],
+                finalNote: String(src.final_note || '').trim(),
+                source: String(src.source || '').trim(),
+            };
+        }
+
+        function renderAiStructuredSummaryCard(summary = {}) {
+            const s = normalizeAiReviewSummary(summary);
+            const scoreText = (typeof s.score === 'number' && Number.isFinite(s.score)) ? Number(s.score).toFixed(1) : '--';
+            const buyItems = s.buyPoints.map((item) => `${String(item.dt || '--').trim()}｜${String(item.reason || item.signal_logic || '--').trim()}`);
+            const sellItems = s.sellPoints.map((item) => `${String(item.dt || '--').trim()}｜${String(item.reason || item.signal_logic || '--').trim()}`);
+            const paramItems = s.parameterSuggestions.map((item) => `${String(item.name || '--').trim()} → ${String(item.suggested || '--').trim()}${String(item.why || '').trim() ? `（${String(item.why || '').trim()}）` : ''}`);
+            const expItems = s.nextExperiments.map((item) => `${String(item.label || '--').trim()}：${String(item.expectation || JSON.stringify(item.params || {}, null, 0) || '--').trim()}`);
+            const metricsHtml = renderReviewMetricGrid([
+                { label: '核心结论', value: s.title || '--' },
+                { label: '综合评分', value: scoreText },
+                { label: '结构来源', value: s.source || '--' },
+            ]);
+            return `
+                <div class="rounded border border-violet-500/20 bg-violet-500/5 px-3 py-3 mb-3">
+                    <div class="flex items-center gap-2 flex-wrap mb-2">
+                        <div class="text-sm font-semibold text-white">AI结构化摘要</div>
+                        ${renderReviewVerdictBadge(s.verdict, 'ai')}
+                    </div>
+                    ${metricsHtml}
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                        <div><div class="text-xs text-slate-400 mb-1">关键问题</div>${renderReviewList(s.highlights, '暂无关键问题')}</div>
+                        <div><div class="text-xs text-slate-400 mb-1">主要风险</div>${renderReviewList(s.risks, '暂无风险提示')}</div>
+                        <div><div class="text-xs text-slate-400 mb-1">硅基节点分析</div>${renderReviewList(buyItems, '本周期无硅基节点')}</div>
+                        <div><div class="text-xs text-slate-400 mb-1">流码节点分析</div>${renderReviewList(sellItems, '本周期无流码节点')}</div>
+                        <div><div class="text-xs text-slate-400 mb-1">参数优化建议</div>${renderReviewList(paramItems, '暂无参数建议')}</div>
+                        <div><div class="text-xs text-slate-400 mb-1">下一轮实验方案</div>${renderReviewList(expItems, '暂无实验方案')}</div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderBuffettStructuredSummaryCard(summary = {}) {
+            const s = normalizeBuffettReviewSummary(summary);
+            const checklistItems = s.sellChecklist.map((item) => `${String(item.key || '--').trim()}｜${String(item.status || '--').trim()}${String(item.note || '').trim() ? `｜${String(item.note || '').trim()}` : ''}`);
+            const metricsHtml = renderReviewMetricGrid([
+                { label: '结论', value: s.title || '--' },
+                { label: '能力圈判断', value: s.circleOfCompetence || '--' },
+                { label: '结构来源', value: s.source || '--' },
+            ]);
+            return `
+                <div class="rounded border border-amber-500/20 bg-amber-500/5 px-3 py-3 mb-3">
+                    <div class="flex items-center gap-2 flex-wrap mb-2">
+                        <div class="text-sm font-semibold text-white">巴菲特版结构化摘要</div>
+                        ${renderReviewVerdictBadge(s.verdict, 'buffett')}
+                    </div>
+                    ${metricsHtml}
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+                        <div><div class="text-xs text-slate-400 mb-1">关键假设</div>${renderReviewList(s.keyAssumptions, '暂无关键假设')}</div>
+                        <div><div class="text-xs text-slate-400 mb-1">业务质量代理评估</div>${renderReviewList(s.qualityAssessment, '暂无业务质量评估')}</div>
+                        <div><div class="text-xs text-slate-400 mb-1">安全边际代理评估</div>${renderReviewList(s.marginOfSafety, '暂无安全边际评估')}</div>
+                        <div><div class="text-xs text-slate-400 mb-1">流码标准检查</div>${renderReviewList(checklistItems, '暂无流码标准检查')}</div>
+                        <div><div class="text-xs text-slate-400 mb-1">三大风险</div>${renderReviewList(s.topRisks, '暂无风险提示')}</div>
+                        <div><div class="text-xs text-slate-400 mb-1">监控指标</div>${renderReviewList(s.monitoringMetrics, '暂无监控指标')}</div>
+                    </div>
+                    ${s.finalNote ? `<div class="text-xs text-slate-300 mt-3">最终结论：${s.finalNote}</div>` : ''}
+                </div>
+            `;
+        }
+
+        function renderAiReviewCard(opts = {}) {
+            const card = document.getElementById('ai-review-card');
+            if (!card) return;
+            const loading = Boolean(opts.loading);
+            const markdown = String(opts.markdown || '').trim();
+            const error = String(opts.error || '').trim();
+            const cached = Boolean(opts.cached);
+            const summary = (opts.summary && typeof opts.summary === 'object') ? opts.summary : null;
+            if (loading) {
+                card.classList.remove('hidden');
+                card.innerHTML = '<div class="text-sm text-slate-300"><i class="fa-solid fa-spinner fa-spin mr-2"></i>AI复盘生成中...</div>';
+                return;
+            }
+            if (markdown || summary) {
+                card.classList.remove('hidden');
+                card.innerHTML = `
+                    <div class="text-lg font-semibold text-white mb-2">AI复盘分析 ${cached ? '<span class="text-xs text-slate-500">(缓存)</span>' : ''}</div>
+                    ${summary ? renderAiStructuredSummaryCard(summary) : ''}
+                    ${markdown ? `<div class="text-sm leading-7 text-slate-200">${renderMarkdownHtml(markdown)}</div>` : '<div class="text-slate-500 text-sm">暂无复盘正文</div>'}
+                `;
+                return;
+            }
+            if (error) {
+                card.classList.remove('hidden');
+                card.innerHTML = `<div class="text-rose-300 text-sm">AI复盘失败：${error}</div>`;
+                return;
+            }
+            card.classList.add('hidden');
+            card.innerHTML = '';
+        }
+
+        function renderBuffettReviewCard(opts = {}) {
+            const card = document.getElementById('buffett-review-card');
+            if (!card) return;
+            const loading = Boolean(opts.loading);
+            const markdown = String(opts.markdown || '').trim();
+            const error = String(opts.error || '').trim();
+            const cached = Boolean(opts.cached);
+            const summary = (opts.summary && typeof opts.summary === 'object') ? opts.summary : null;
+            if (loading) {
+                card.classList.remove('hidden');
+                card.innerHTML = '<div class="text-sm text-slate-300"><i class="fa-solid fa-spinner fa-spin mr-2"></i>巴菲特版复盘生成中...</div>';
+                return;
+            }
+            if (markdown || summary) {
+                card.classList.remove('hidden');
+                card.innerHTML = `
+                    <div class="text-lg font-semibold text-white mb-2">巴菲特版复盘 ${cached ? '<span class="text-xs text-slate-500">(缓存)</span>' : ''}</div>
+                    ${summary ? renderBuffettStructuredSummaryCard(summary) : ''}
+                    ${markdown ? `<div class="text-sm leading-7 text-slate-200">${renderMarkdownHtml(markdown)}</div>` : '<div class="text-slate-500 text-sm">暂无复盘正文</div>'}
+                `;
+                return;
+            }
+            if (error) {
+                card.classList.remove('hidden');
+                card.innerHTML = `<div class="text-rose-300 text-sm">巴菲特版复盘失败：${error}</div>`;
+                return;
+            }
+            card.classList.add('hidden');
+            card.innerHTML = '';
+        }
+
+        function getAiReviewState(reportId) {
+            const rid = String(reportId || '').trim();
+            if (!rid) return { loading: false, markdown: '', summary: null, error: '', cached: false };
+            const state = aiReviewStateMap[rid];
+            if (state && typeof state === 'object') return state;
+            return { loading: false, markdown: '', summary: null, error: '', cached: false };
+        }
+
+        function setAiReviewState(reportId, patch = {}) {
+            const rid = String(reportId || '').trim();
+            if (!rid) return;
+            const prev = getAiReviewState(rid);
+            aiReviewStateMap[rid] = {
+                loading: Boolean(Object.prototype.hasOwnProperty.call(patch, 'loading') ? patch.loading : prev.loading),
+                markdown: String(Object.prototype.hasOwnProperty.call(patch, 'markdown') ? (patch.markdown || '') : (prev.markdown || '')),
+                summary: Object.prototype.hasOwnProperty.call(patch, 'summary') ? ((patch.summary && typeof patch.summary === 'object') ? patch.summary : null) : prev.summary,
+                error: String(Object.prototype.hasOwnProperty.call(patch, 'error') ? (patch.error || '') : (prev.error || '')),
+                cached: Boolean(Object.prototype.hasOwnProperty.call(patch, 'cached') ? patch.cached : prev.cached)
+            };
+        }
+
+        function getBuffettReviewState(reportId) {
+            const rid = String(reportId || '').trim();
+            if (!rid) return { loading: false, markdown: '', summary: null, error: '', cached: false };
+            const state = buffettReviewStateMap[rid];
+            if (state && typeof state === 'object') return state;
+            return { loading: false, markdown: '', summary: null, error: '', cached: false };
+        }
+
+        function setBuffettReviewState(reportId, patch = {}) {
+            const rid = String(reportId || '').trim();
+            if (!rid) return;
+            const prev = getBuffettReviewState(rid);
+            buffettReviewStateMap[rid] = {
+                loading: Boolean(Object.prototype.hasOwnProperty.call(patch, 'loading') ? patch.loading : prev.loading),
+                markdown: String(Object.prototype.hasOwnProperty.call(patch, 'markdown') ? (patch.markdown || '') : (prev.markdown || '')),
+                summary: Object.prototype.hasOwnProperty.call(patch, 'summary') ? ((patch.summary && typeof patch.summary === 'object') ? patch.summary : null) : prev.summary,
+                error: String(Object.prototype.hasOwnProperty.call(patch, 'error') ? (patch.error || '') : (prev.error || '')),
+                cached: Boolean(Object.prototype.hasOwnProperty.call(patch, 'cached') ? patch.cached : prev.cached)
+            };
+        }
+
+        async function ensureStrategyMetaLoaded() {
+            if (strategyMetaLoaded) return;
+            try {
+                const res = await fetch('/api/strategy_manager/list');
+                const data = await res.json();
+                if (data && data.status === 'success' && Array.isArray(data.strategies)) {
+                    data.strategies.forEach(s => {
+                        const sid = String(s.id || '');
+                        const sname = String(s.name || '').trim();
+                        const skline = String(s.kline_type || '').trim();
+                        if (sid && sname) STRATEGY_NAME_MAP[sid] = sname;
+                        if (sid && skline) STRATEGY_PERIOD_MAP[sid] = periodLabelFromKlineType(skline);
+                    });
+                }
+            } catch (_) {}
+            strategyMetaLoaded = true;
+        }
+
+        async function loadReport(reportId = null) {
+            const url = reportId ? `/api/report/${reportId}` : '/api/report/latest';
+            try {
+                await ensureStrategyMetaLoaded();
+                const res = await fetch(url);
+                if (!res.ok) {
+                    const txt = await res.text();
+                    throw new Error(`${res.status} ${txt}`);
+                }
+                const data = await res.json();
+                currentReportId = String(data.report_id || reportId || '').trim() || null;
+                lastReportSummary = data.summary || null;
+                lastReportRanking = Array.isArray(data.ranking) ? data.ranking : [];
+                lastReportStrategyReports = Array.isArray(data.strategy_reports) ? data.strategy_reports : [];
+                lastConsistencySummary = (data.consistency_summary && typeof data.consistency_summary === 'object') ? data.consistency_summary : null;
+                renderSummary(lastReportSummary);
+                renderRanking(lastReportRanking);
+                renderStrategyReports(lastReportStrategyReports, lastConsistencySummary);
+                renderInsight(lastReportSummary, lastReportRanking, lastReportStrategyReports, lastConsistencySummary);
+                renderFundamentalReadonly(data.fundamental_profile || null);
+                if (!aiReviewLoading || aiReviewLoadingReportId !== currentReportId) {
+                    const cached = String(data.ai_review_text || '').trim();
+                    const summary = (data.ai_review_summary && typeof data.ai_review_summary === 'object') ? data.ai_review_summary : null;
+                    if (cached || summary) {
+                        setAiReviewState(currentReportId, { markdown: cached, summary, error: '', cached: true, loading: false });
+                    }
+                    renderAiReviewCard(getAiReviewState(currentReportId));
+                }
+                if (!buffettReviewLoading || buffettReviewLoadingReportId !== currentReportId) {
+                    const cachedBuffett = String(data.buffett_review_text || '').trim();
+                    const summary = (data.buffett_review_summary && typeof data.buffett_review_summary === 'object') ? data.buffett_review_summary : null;
+                    if (cachedBuffett || summary) {
+                        setBuffettReviewState(currentReportId, { markdown: cachedBuffett, summary, error: '', cached: true, loading: false });
+                    }
+                    renderBuffettReviewCard(getBuffettReviewState(currentReportId));
+                }
+            } catch (err) {
+                const msg = (err && err.message) ? err.message : String(err);
+                renderSummary({ stock: "--", period: "--", total_trades: 0 });
+                lastConsistencySummary = null;
+                const card = document.getElementById('summary-card');
+                card.innerHTML += `<div class="text-rose-300 text-xs mt-2">报告加载失败：${msg}</div>`;
+                renderRanking([]);
+                renderStrategyReports([], null);
+                renderInsight(null, [], [], null);
+                renderFundamentalReadonly(null);
+                renderAiReviewCard({ loading: false, markdown: '', summary: null, error: '', cached: false });
+                renderBuffettReviewCard({ loading: false, markdown: '', summary: null, error: '', cached: false });
+            }
+        }
+
+        async function loadHistory() {
+            const res = await fetch('/api/report/history');
+            const data = await res.json();
+            const wrap = document.getElementById('history-list');
+            wrap.innerHTML = '';
+            const reports = data.reports || [];
+            if (!reports.length) {
+                wrap.innerHTML = '<div class="text-slate-500 text-sm">暂无历史回测记录</div>';
+                return;
+            }
+            if (!currentReportId && reports.length) {
+                currentReportId = String(reports[0].report_id);
+            } else if (currentReportId && !reports.some(x => String(x.report_id) === String(currentReportId))) {
+                currentReportId = reports.length ? String(reports[0].report_id) : null;
+            }
+            reports.forEach((r, idx) => {
+                const rid = String(r.report_id);
+                const active = currentReportId && String(currentReportId) === rid;
+                const row = document.createElement('div');
+                row.className = `flex items-start justify-between gap-2 border rounded px-3 py-2 text-sm enter-anim transition-all duration-200 ${active ? 'bg-blue-900/30 border-blue-700' : 'bg-slate-800/50 border-slate-700 hover:bg-slate-800/80'}`;
+                row.innerHTML = `
+                    <div class="text-slate-300 flex-1 min-w-0">
+                        <div class="truncate leading-6">
+                            <span class="font-mono text-white mr-2">${r.stock_code || '--'}</span>
+                            <span>${r.period || '--'}</span>
+                        </div>
+                        <div class="text-slate-500 truncate text-xs">${r.created_at || ''}</div>
+                    </div>
+                    <div class="flex items-center gap-2 shrink-0 self-center">
+                        <button class="text-blue-400 hover:text-blue-300 underline cursor-pointer whitespace-nowrap px-1 py-0.5 rounded transition-all duration-200 hover:bg-blue-900/30 active:scale-95" data-rid="${rid}">${idx === 0 ? '查看（最新）' : '查看'}</button>
+                        <button class="text-rose-400 hover:text-rose-300 underline cursor-pointer whitespace-nowrap px-1 py-0.5 rounded transition-all duration-200 hover:bg-rose-900/30 active:scale-95" data-del-rid="${rid}">删除</button>
+                    </div>
+                `;
+                wrap.appendChild(row);
+            });
+        }
+
+        async function deleteHistoryReport(reportId) {
+            const rid = String(reportId || '').trim();
+            if (!rid) return;
+            try {
+                const res = await fetch('/api/report/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ report_id: rid })
+                });
+                const data = await res.json();
+                if (data.status !== 'success') throw new Error(data.msg || '删除失败');
+                if (currentReportId && String(currentReportId) === rid) currentReportId = null;
+                await loadHistory();
+                await loadReport(currentReportId || null);
+            } catch (_) {}
+        }
+
+        function renderSummary(summary) {
+            const card = document.getElementById('summary-card');
+            if (!summary) {
+                card.classList.remove('hidden');
+                card.innerHTML = '<div class="text-slate-400">暂无回测数据，请先在控制台执行一次回测。</div>';
+                return;
+            }
+            card.classList.remove('hidden');
+            card.innerHTML = `
+                <div class="text-sm text-slate-400">标的：<span class="text-white font-mono">${summary.stock || '--'}</span></div>
+                <div class="text-sm text-slate-400">区间：<span class="text-white">${summary.period || '--'}</span></div>
+                <div class="text-sm text-slate-400">总交易数：<span class="text-white font-mono">${summary.total_trades ?? 0}</span></div>
+            `;
+        }
+
+        function renderRanking(ranking) {
+            const body = document.getElementById('ranking-body');
+            const mobile = document.getElementById('ranking-mobile');
+            body.innerHTML = '';
+            mobile.innerHTML = '';
+            if (!ranking.length) {
+                body.innerHTML = '<tr><td colspan="10" class="px-3 py-6 text-center text-slate-500">暂无策略对比数据</td></tr>';
+                mobile.innerHTML = '<div class="text-center text-slate-500 py-3">暂无策略对比数据</div>';
+                return;
+            }
+            ranking.forEach(r => {
+                const sid = String(r.strategy_id);
+                const tr = document.createElement('tr');
+                tr.className = 'hover:bg-slate-800/40';
+                const roi = Number(r.annualized_roi || 0);
+                const dd = Number(r.max_dd || 0);
+                const winRate = Number(r.win_rate || 0);
+                const score = Number(r.score_total || 0);
+                tr.innerHTML = `
+                    <td class="px-3 py-2">#${r.rank ?? '-'}</td>
+                    <td class="px-3 py-2 font-mono">${sid}</td>
+                    <td class="px-3 py-2">${STRATEGY_PERIOD_MAP[sid] || '--'}</td>
+                    <td class="px-3 py-2">${r.rating ?? '-'}</td>
+                    <td class="px-3 py-2 text-yellow-300">${score.toFixed(1)}</td>
+                    <td class="px-3 py-2 ${roi >= 0 ? 'text-rose-400' : 'text-emerald-400'}">${(roi*100).toFixed(2)}%</td>
+                    <td class="px-3 py-2 text-rose-300">${(dd*100).toFixed(2)}%</td>
+                    <td class="px-3 py-2 text-cyan-300">${(winRate*100).toFixed(2)}%</td>
+                    <td class="px-3 py-2">${Number(r.calmar || 0).toFixed(2)}</td>
+                    <td class="px-3 py-2"><a href="#strategy-${sid}" class="text-blue-400 hover:text-blue-300 underline">单策略回测报告</a></td>
+                `;
+                body.appendChild(tr);
+                const card = document.createElement('div');
+                card.className = 'bg-slate-800/50 border border-slate-700 rounded p-3 text-sm enter-anim transition-all duration-200 hover:border-slate-500 hover:-translate-y-0.5';
+                card.innerHTML = `
+                    <div class="text-white font-semibold mb-1">#${r.rank ?? '-'} 策略 ${sid} · ${r.rating ?? '-'}</div>
+                    <div class="text-yellow-300">评分：${score.toFixed(1)} / 100</div>
+                    <div class="text-slate-300">使用周期：${STRATEGY_PERIOD_MAP[sid] || '--'}</div>
+                    <div class="${roi >= 0 ? 'text-rose-400' : 'text-emerald-400'}">年化收益：${(roi*100).toFixed(2)}%</div>
+                    <div class="text-rose-300">最大回撤：${(dd*100).toFixed(2)}%</div>
+                    <div class="text-cyan-300">胜率：${(winRate*100).toFixed(2)}%</div>
+                    <div class="text-slate-300">卡玛：${Number(r.calmar || 0).toFixed(2)}</div>
+                    <a href="#strategy-${sid}" class="text-blue-400 hover:text-blue-300 underline">查看单策略报告</a>
+                `;
+                mobile.appendChild(card);
+            });
+        }
+
+        function renderInsight(summary, ranking, reports, consistencySummary = null) {
+            const card = document.getElementById('insight-card');
+            if (!summary || !ranking.length) {
+                card.classList.add('hidden');
+                card.innerHTML = '';
+                return;
+            }
+            const best = ranking[0] || {};
+            const active = reports.filter(r => Number(r.trade_count || 0) > 0);
+            const activeCount = active.length;
+            const total = reports.length;
+            const netState = Number(summary.total_trades || 0) === 0 ? '全策略空仓' : '策略已恢复成交';
+            const isCurrentAiReviewLoading = aiReviewLoading && aiReviewLoadingReportId === String(currentReportId || '');
+            const isCurrentBuffettReviewLoading = buffettReviewLoading && buffettReviewLoadingReportId === String(currentReportId || '');
+            const consistency = (consistencySummary && typeof consistencySummary === 'object') ? consistencySummary : null;
+            const consistencyReportId = String(consistency?.consistency_report_id || '').trim();
+            const mismatchCount = Number(consistency?.mismatch_count || 0);
+            const divergenceStage = String(consistency?.first_divergence_stage || '').trim() || '--';
+            const topRootCause = String(consistency?.top_root_cause || '').trim();
+            const scopeSummary = String(consistency?.comparison_scope_summary || '').trim();
+            const consistencyHtml = consistencyReportId
+                ? `
+                    <div class="mt-3 rounded border border-violet-500/30 bg-violet-500/10 px-3 py-2 text-xs leading-6 text-slate-200">
+                        <div class="text-violet-200 font-semibold">一致性对比</div>
+                        <div>报告ID：<span class="font-mono">${consistencyReportId}</span> · 差异笔数：<span class="text-amber-300">${mismatchCount}</span> · 首次分叉：<span class="text-cyan-300">${divergenceStage}</span></div>
+                        ${topRootCause ? `<div>优先原因：<span class="text-amber-200">${topRootCause}</span></div>` : ''}
+                        ${scopeSummary ? `<div class="text-slate-300">范围：${scopeSummary}</div>` : ''}
+                    </div>
+                `
+                : '';
+            card.classList.remove('hidden');
+            card.innerHTML = `
+                <div class="text-lg font-semibold text-white mb-2">内阁总评</div>
+                <div class="text-sm text-slate-300 leading-7">
+                    本次回测状态：<span class="font-semibold text-blue-300">${netState}</span>。
+                    最佳策略为 <span class="font-semibold text-emerald-300">${best.strategy_id || '--'}</span>，
+                    评级 <span class="font-semibold text-yellow-300">${best.rating || '--'}</span>，
+                    年化收益 <span class="font-semibold ${(Number(best.annualized_roi || 0) >= 0 ? 'text-rose-300' : 'text-emerald-300')}">${(Number(best.annualized_roi || 0) * 100).toFixed(2)}%</span>。
+                    当前有 <span class="font-semibold text-cyan-300">${activeCount}</span>/<span class="font-semibold text-cyan-300">${total}</span> 个策略产生实盘级成交。
+                </div>
+                ${consistencyHtml}
+                <div class="mt-3">
+                    <button onclick="runAiReview()" ${isCurrentAiReviewLoading ? 'disabled' : ''} class="text-xs px-3 py-1.5 rounded border ${isCurrentAiReviewLoading ? 'bg-violet-900/70 border-violet-700 text-violet-200 cursor-not-allowed' : 'bg-violet-700 hover:bg-violet-600 border-violet-500 text-white'}">${isCurrentAiReviewLoading ? 'AI复盘生成中...' : 'AI复盘分析'}</button>
+                    <button onclick="runBuffettReview()" ${isCurrentBuffettReviewLoading ? 'disabled' : ''} class="text-xs px-3 py-1.5 rounded border ml-2 ${isCurrentBuffettReviewLoading ? 'bg-amber-900/70 border-amber-700 text-amber-200 cursor-not-allowed' : 'bg-amber-700 hover:bg-amber-600 border-amber-500 text-white'}">${isCurrentBuffettReviewLoading ? 'Buffett版生成中...' : 'Buffett版复盘'}</button>
+                </div>
+            `;
+        }
+
+        function cleanupReportRadarCharts() {
+            Object.keys(reportRadarCharts).forEach((key) => {
+                try {
+                    reportRadarCharts[key]?.destroy();
+                } catch (_) {}
+                delete reportRadarCharts[key];
+            });
+        }
+
+        function buildScorecardRadarModel(scorecard = {}) {
+            const dim = (scorecard && typeof scorecard === 'object' && scorecard.dimensions && typeof scorecard.dimensions === 'object')
+                ? scorecard.dimensions
+                : {};
+            const items = [
+                { key: 'profitability', label: '收益能力', color: '#f59e0b' },
+                { key: 'risk_control', label: '风险控制', color: '#38bdf8' },
+                { key: 'pnl_quality', label: '盈亏质量', color: '#a78bfa' },
+                { key: 'practicality', label: '实战可行', color: '#34d399' }
+            ].map((item) => {
+                const row = (dim[item.key] && typeof dim[item.key] === 'object') ? dim[item.key] : {};
+                return {
+                    ...item,
+                    score: Number(row.score || 0),
+                    maxScore: Math.max(1, Number(row.max_score || 0))
+                };
+            });
+            return {
+                labels: items.map(item => item.label),
+                scores: items.map(item => item.score),
+                maxScores: items.map(item => item.maxScore),
+                normalizedScores: items.map(item => Math.round((item.score / item.maxScore) * 1000) / 10),
+                rawItems: items
+            };
+        }
+
+        function buildStrategyReportBadges(report = {}, scorecard = {}, consistencySummary = null) {
+            const badges = [];
+            const grade = String(scorecard.grade || '').trim();
+            const conclusion = String(scorecard.conclusion || '').trim();
+            const tradeCount = Number(report.trade_count || 0);
+            const forceCloseCount = Number(report.force_close_count || 0);
+            const notes = Array.isArray(report.report_notes) ? report.report_notes.filter(Boolean) : [];
+            const consistency = (consistencySummary && typeof consistencySummary === 'object') ? consistencySummary : null;
+            const consistencyReportId = String(consistency?.consistency_report_id || '').trim();
+            if (grade) {
+                badges.push({
+                    tone: 'yellow',
+                    text: `评级 ${grade}${conclusion ? ` · ${conclusion}` : ''}`
+                });
+            }
+            if (consistencyReportId) {
+                badges.push({
+                    tone: 'cyan',
+                    text: `一致性报告 ${consistencyReportId}`
+                });
+            }
+            if (consistency && Number(consistency.mismatch_count || 0) > 0) {
+                badges.push({
+                    tone: 'amber',
+                    text: `差异 ${Number(consistency.mismatch_count || 0)} 笔 · 首次分叉 ${String(consistency.first_divergence_stage || '--')}`
+                });
+            }
+            if (tradeCount === 0) {
+                badges.push({ tone: 'amber', text: '本次无成交' });
+            }
+            if (forceCloseCount > 0) {
+                badges.push({ tone: 'rose', text: `出现兜底强平 ${forceCloseCount} 次` });
+            }
+            notes.slice(0, 3).forEach((note) => {
+                badges.push({ tone: 'slate', text: String(note) });
+            });
+            return badges;
+        }
+
+        function badgeClassByTone(tone = 'slate') {
+            if (tone === 'yellow') return 'bg-yellow-500/10 text-yellow-200 border-yellow-500/30';
+            if (tone === 'amber') return 'bg-amber-500/10 text-amber-200 border-amber-500/30';
+            if (tone === 'rose') return 'bg-rose-500/10 text-rose-200 border-rose-500/30';
+            if (tone === 'cyan') return 'bg-cyan-500/10 text-cyan-200 border-cyan-500/30';
+            return 'bg-slate-700/40 text-slate-200 border-slate-600/60';
+        }
+
+        function renderReportRadarChart(canvasId, scorecard = {}) {
+            const canvas = document.getElementById(canvasId);
+            if (!canvas || !window.Chart) return;
+            const existing = reportRadarCharts[canvasId];
+            if (existing && typeof existing.destroy === 'function') {
+                existing.destroy();
+            }
+            const model = buildScorecardRadarModel(scorecard);
+            reportRadarCharts[canvasId] = new Chart(canvas, {
+                type: 'radar',
+                data: {
+                    labels: model.labels,
+                    datasets: [
+                        {
+                            label: '评分达成度',
+                            data: model.normalizedScores,
+                            borderColor: '#38bdf8',
+                            backgroundColor: 'rgba(56, 189, 248, 0.18)',
+                            pointBackgroundColor: ['#f59e0b', '#38bdf8', '#a78bfa', '#34d399'],
+                            pointBorderColor: '#e2e8f0',
+                            pointHoverBackgroundColor: '#ffffff',
+                            borderWidth: 2,
+                            pointRadius: 3,
+                            pointHoverRadius: 4
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                label: (context) => {
+                                    const item = model.rawItems[context.dataIndex] || {};
+                                    return `${item.label || ''}：${Number(item.score || 0).toFixed(1)} / ${Number(item.maxScore || 0).toFixed(0)}（${Number(context.raw || 0).toFixed(1)}%）`;
+                                }
+                            }
+                        }
+                    },
+                    scales: {
+                        r: {
+                            min: 0,
+                            max: 100,
+                            ticks: {
+                                stepSize: 20,
+                                color: '#94a3b8',
+                                backdropColor: 'transparent'
+                            },
+                            angleLines: { color: 'rgba(148, 163, 184, 0.18)' },
+                            grid: { color: 'rgba(148, 163, 184, 0.18)' },
+                            pointLabels: {
+                                color: '#e2e8f0',
+                                font: { size: 12 }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        function renderStrategyReports(reports, consistencySummary = null) {
+            const wrap = document.getElementById('strategy-report-list');
+            cleanupReportRadarCharts();
+            wrap.innerHTML = '';
+            Object.keys(strategyReportMap).forEach(k => delete strategyReportMap[k]);
+            if (!reports.length) {
+                wrap.innerHTML = '<div class="text-slate-500">暂无单策略报告</div>';
+                return;
+            }
+            const consistency = (consistencySummary && typeof consistencySummary === 'object') ? consistencySummary : null;
+            reports.forEach(r => {
+                const sid = String(r.strategy_id);
+                strategyReportMap[sid] = r;
+                if (r.period_label) STRATEGY_PERIOD_MAP[sid] = String(r.period_label);
+                const sname = STRATEGY_NAME_MAP[sid] || "未知策略";
+                const card = document.createElement('div');
+                card.id = `strategy-${sid}`;
+                card.className = 'bg-slate-800/50 border border-slate-700 rounded-lg p-4 text-sm enter-anim transition-all duration-200 hover:border-slate-500 hover:-translate-y-0.5';
+                const sc = r.scorecard || {};
+                const dim = sc.dimensions || {};
+                const profitability = Number((dim.profitability || {}).score || 0);
+                const profitabilityMax = Number((dim.profitability || {}).max_score || 30);
+                const riskControl = Number((dim.risk_control || {}).score || 0);
+                const riskControlMax = Number((dim.risk_control || {}).max_score || 35);
+                const pnlQuality = Number((dim.pnl_quality || {}).score || 0);
+                const pnlQualityMax = Number((dim.pnl_quality || {}).max_score || 20);
+                const practicality = Number((dim.practicality || {}).score || 0);
+                const practicalityMax = Number((dim.practicality || {}).max_score || 15);
+                const forceCloseCount = Number(r.force_close_count || 0);
+                const tradeCount = Number(r.trade_count || 0);
+                const notes = Array.isArray(r.report_notes) ? r.report_notes : [];
+                const badges = buildStrategyReportBadges(r, sc, consistency);
+                const radarCanvasId = `strategy-radar-${sid}`;
+                const consistencyReason = String(consistency?.top_root_cause || '').trim();
+                const consistencyScope = String(consistency?.comparison_scope_summary || '').trim();
+                const consistencyExtraHtml = consistency?.consistency_report_id
+                    ? `
+                        <div class="rounded border border-violet-500/20 bg-violet-500/5 px-3 py-2 mt-3 text-xs leading-6 text-slate-200">
+                            <div class="text-violet-200 font-semibold">一致性诊断摘要</div>
+                            <div>报告ID：<span class="font-mono">${String(consistency.consistency_report_id || '').trim()}</span></div>
+                            <div>实盘 ${Number(consistency.live_trade_count || 0)} 笔 / 回测 ${Number(consistency.replay_trade_count || 0)} 笔 / 差异 ${Number(consistency.mismatch_count || 0)} 笔</div>
+                            <div>首次分叉：<span class="text-cyan-300">${String(consistency.first_divergence_stage || '--')}</span> · 原因码：<span class="text-amber-300">${String(consistency.first_divergence_reason || '--')}</span></div>
+                            ${consistencyReason ? `<div>建议先看：<span class="text-amber-200">${consistencyReason}</span></div>` : ''}
+                            ${consistencyScope ? `<div class="text-slate-300">范围：${consistencyScope}</div>` : ''}
+                        </div>
+                    `
+                    : '';
+                const noTradeHint = tradeCount === 0
+                    ? '<div class="text-amber-300 mt-1">本次无成交，可能未触发信号、未纳入本次回测策略或下单数量不足100股。</div>'
+                    : '';
+                const badgeHtml = badges.length
+                    ? `<div class="flex flex-wrap gap-2 mt-3">${badges.map((badge) => `<span class="px-2 py-1 rounded-full border text-xs ${badgeClassByTone(badge.tone)}">${badge.text}</span>`).join('')}</div>`
+                    : '';
+                card.innerHTML = `
+                    <div class="flex flex-col gap-4">
+                        <div class="min-w-0">
+                            <div class="font-bold text-white mb-2">策略 ${sid} · ${sname}</div>
+                            <div class="text-yellow-300 mb-2">评分卡：${Number(sc.total_score || 0).toFixed(1)} / 100 · ${sc.grade || '--'}（${sc.conclusion || '--'}）</div>
+                            <div class="mb-2 flex items-center gap-2 flex-wrap">
+                                <button onclick="openTradeDetails('${sid}')" class="text-xs bg-blue-700 hover:bg-blue-600 text-white px-2 py-1 rounded border border-blue-600">交易明细</button>
+                                <button onclick="openStrategyKline('${sid}')" class="text-xs bg-indigo-700 hover:bg-indigo-600 text-white px-2 py-1 rounded border border-indigo-600">K线显示</button>
+                            </div>
+                            <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-x-4 gap-y-1 text-slate-300">
+                                <div>使用周期：${STRATEGY_PERIOD_MAP[sid] || '--'}</div>
+                                <div>回测周期：${r.start_date} ~ ${r.end_date}</div>
+                                <div>初始资金：${Number(r.init_capital || 0).toFixed(2)} 元</div>
+                                <div>结束资金：${Number(r.end_capital || 0).toFixed(2)} 元</div>
+                                <div>总收益：${(Number(r.total_return || 0)*100).toFixed(2)}%</div>
+                                <div>年化收益：${(Number(r.annual_return || 0)*100).toFixed(2)}%</div>
+                                <div>最大回撤：${(Number(r.max_drawdown || 0)*100).toFixed(2)}%</div>
+                                <div>总交易次数：${tradeCount}</div>
+                                <div>盈利次数：${r.win_num ?? 0} | 亏损次数：${r.loss_num ?? 0}</div>
+                                <div>胜率：${(Number(r.win_rate || 0)*100).toFixed(2)}%</div>
+                                <div>平均盈利：${Number(r.avg_win || 0).toFixed(2)} | 平均亏损：${Number(r.avg_loss || 0).toFixed(2)}</div>
+                                <div>盈亏比：${Number(r.profit_ratio || 0).toFixed(2)}</div>
+                                <div>兜底强平次数：${forceCloseCount}</div>
+                            </div>
+                            ${notes.length ? `<div class="text-amber-300 mt-2">说明：${notes.join('；')}</div>` : ''}
+                            ${noTradeHint}
+                            ${badgeHtml}
+                            ${consistencyExtraHtml}
+                        </div>
+                        <div class="rounded-lg border border-slate-700 bg-slate-900/70 p-3">
+                            <div class="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between mb-2">
+                                <div class="text-slate-200 text-sm font-semibold">四维雷达图</div>
+                                <div class="text-xs text-slate-400">雷达图下移展示，避免挤占单策略报告正文空间</div>
+                            </div>
+                            <div class="grid grid-cols-1 xl:grid-cols-[240px_minmax(0,1fr)] gap-3 xl:items-start">
+                                <div class="h-52 max-w-[240px] w-full mx-auto xl:mx-0" id="${radarCanvasId}-wrap">
+                                    <canvas id="${radarCanvasId}"></canvas>
+                                </div>
+                                <div class="grid grid-cols-2 gap-2 text-xs">
+                                    <div class="rounded border border-slate-700 bg-slate-950/60 px-2 py-2 text-slate-300">收益能力：<span class="text-yellow-300">${profitability.toFixed(1)} / ${profitabilityMax.toFixed(0)}</span></div>
+                                    <div class="rounded border border-slate-700 bg-slate-950/60 px-2 py-2 text-slate-300">风险控制：<span class="text-cyan-300">${riskControl.toFixed(1)} / ${riskControlMax.toFixed(0)}</span></div>
+                                    <div class="rounded border border-slate-700 bg-slate-950/60 px-2 py-2 text-slate-300">盈亏质量：<span class="text-violet-300">${pnlQuality.toFixed(1)} / ${pnlQualityMax.toFixed(0)}</span></div>
+                                    <div class="rounded border border-slate-700 bg-slate-950/60 px-2 py-2 text-slate-300">实战可行：<span class="text-emerald-300">${practicality.toFixed(1)} / ${practicalityMax.toFixed(0)}</span></div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                `;
+                wrap.appendChild(card);
+                renderReportRadarChart(radarCanvasId, sc);
+            });
+        }
+
+        async function runAiReview() {
+            const rid = String(currentReportId || '').trim();
+            if (!rid) return;
+            if (aiReviewLoading && aiReviewLoadingReportId === rid) return;
+            aiReviewLoading = true;
+            aiReviewLoadingReportId = rid;
+            setAiReviewState(rid, { loading: true, summary: null, error: '', cached: false });
+            renderInsight(lastReportSummary, lastReportRanking, lastReportStrategyReports);
+            renderAiReviewCard(getAiReviewState(rid));
+            try {
+                const res = await fetch(`/api/report/${encodeURIComponent(rid)}/ai_review?force=1`, { method: 'POST' });
+                const data = await res.json();
+                if (data.status !== 'success') throw new Error(data.msg || '生成失败');
+                const md = String(data.analysis || '').trim() || '暂无复盘内容';
+                const summary = (data.analysis_summary && typeof data.analysis_summary === 'object') ? data.analysis_summary : null;
+                setAiReviewState(rid, { loading: false, markdown: md, summary, error: '', cached: Boolean(data.cached) });
+                if (String(currentReportId || '') === rid) {
+                    renderAiReviewCard(getAiReviewState(rid));
+                }
+            } catch (e) {
+                const errMsg = e && e.message ? e.message : String(e || '未知错误');
+                setAiReviewState(rid, { loading: false, markdown: '', summary: null, error: errMsg, cached: false });
+                if (String(currentReportId || '') === rid) {
+                    renderAiReviewCard(getAiReviewState(rid));
+                }
+            } finally {
+                aiReviewLoading = false;
+                aiReviewLoadingReportId = null;
+                renderInsight(lastReportSummary, lastReportRanking, lastReportStrategyReports);
+            }
+        }
+
+        async function runBuffettReview() {
+            const rid = String(currentReportId || '').trim();
+            if (!rid) return;
+            if (buffettReviewLoading && buffettReviewLoadingReportId === rid) return;
+            buffettReviewLoading = true;
+            buffettReviewLoadingReportId = rid;
+            setBuffettReviewState(rid, { loading: true, summary: null, error: '', cached: false });
+            renderInsight(lastReportSummary, lastReportRanking, lastReportStrategyReports);
+            renderBuffettReviewCard(getBuffettReviewState(rid));
+            try {
+                const res = await fetch(`/api/report/${encodeURIComponent(rid)}/ai_review_buffett?force=1`, { method: 'POST' });
+                const data = await res.json();
+                if (data.status !== 'success') throw new Error(data.msg || '生成失败');
+                const md = String(data.analysis || '').trim() || '暂无复盘内容';
+                const summary = (data.analysis_summary && typeof data.analysis_summary === 'object') ? data.analysis_summary : null;
+                setBuffettReviewState(rid, { loading: false, markdown: md, summary, error: '', cached: Boolean(data.cached) });
+                if (String(currentReportId || '') === rid) {
+                    renderBuffettReviewCard(getBuffettReviewState(rid));
+                }
+            } catch (e) {
+                const errMsg = e && e.message ? e.message : String(e || '未知错误');
+                setBuffettReviewState(rid, { loading: false, markdown: '', summary: null, error: errMsg, cached: false });
+                if (String(currentReportId || '') === rid) {
+                    renderBuffettReviewCard(getBuffettReviewState(rid));
+                }
+            } finally {
+                buffettReviewLoading = false;
+                buffettReviewLoadingReportId = null;
+                renderInsight(lastReportSummary, lastReportRanking, lastReportStrategyReports);
+            }
+        }
+
+        function ensureReportKlineChart() {
+            if (reportKlineChart && reportKlineCandleSeries && reportKlineVolumeSeries) return true;
+            const container = document.getElementById('report-kline-chart');
+            if (!container || !window.LightweightCharts) return false;
+            reportKlineChart = LightweightCharts.createChart(container, {
+                layout: { background: { color: '#020617' }, textColor: '#cbd5e1' },
+                grid: { vertLines: { color: 'rgba(148,163,184,0.1)' }, horzLines: { color: 'rgba(148,163,184,0.1)' } },
+                rightPriceScale: { borderColor: '#334155' },
+                timeScale: { borderColor: '#334155', timeVisible: true, secondsVisible: false }
+            });
+            const candleOpt = {
+                upColor: '#ef4444',
+                downColor: '#22c55e',
+                borderVisible: false,
+                wickUpColor: '#ef4444',
+                wickDownColor: '#22c55e'
+            };
+            const volumeOpt = {
+                priceFormat: { type: 'volume' },
+                priceScaleId: 'volume',
+                lastValueVisible: false,
+                priceLineVisible: false
+            };
+            if (typeof reportKlineChart.addCandlestickSeries === 'function') {
+                reportKlineCandleSeries = reportKlineChart.addCandlestickSeries(candleOpt);
+                reportKlineVolumeSeries = reportKlineChart.addHistogramSeries(volumeOpt);
+            } else if (typeof reportKlineChart.addSeries === 'function' && window.LightweightCharts?.CandlestickSeries && window.LightweightCharts?.HistogramSeries) {
+                reportKlineCandleSeries = reportKlineChart.addSeries(LightweightCharts.CandlestickSeries, candleOpt);
+                reportKlineVolumeSeries = reportKlineChart.addSeries(LightweightCharts.HistogramSeries, volumeOpt);
+            } else {
+                return false;
+            }
+            reportKlineChart.priceScale('right').applyOptions({ scaleMargins: { top: 0.08, bottom: 0.32 } });
+            reportKlineChart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.75, bottom: 0 } });
+            return true;
+        }
+
+        async function setReportKlineLoading(show, text = 'K线加载中...') {
+            const box = document.getElementById('report-kline-loading');
+            const label = document.getElementById('report-kline-loading-text');
+            if (label) label.innerText = text;
+            if (!box) return;
+            if (show) {
+                reportKlineLoadingShownAt = Date.now();
+                box.classList.remove('hidden');
+                return;
+            }
+            const minShowMs = 260;
+            const waitMs = Math.max(0, minShowMs - (Date.now() - reportKlineLoadingShownAt));
+            if (waitMs > 0) await new Promise(r => setTimeout(r, waitMs));
+            box.classList.add('hidden');
+        }
+
+        async function preloadStrategyKline(reportId, strategyId) {
+            const rid = String(reportId || '');
+            const sid = String(strategyId || '');
+            if (!rid || !sid) return;
+            const key = `${rid}|${sid}`;
+            if (reportKlinePayloadCache[key]) return;
+            try {
+                const q = `report_id=${encodeURIComponent(rid)}&strategy_id=${encodeURIComponent(sid)}`;
+                const res = await fetch(`/api/report/strategy/kline_data?${q}`);
+                const data = await res.json();
+                if (data.status === 'success' && Array.isArray(data.candles) && data.candles.length) {
+                    reportKlinePayloadCache[key] = data;
+                }
+            } catch (_) {}
+        }
+
+        async function openStrategyKline(strategyId) {
+            const sid = String(strategyId || '');
+            if (!sid || !currentReportId) return;
+            await setReportKlineLoading(true, 'K线加载中...');
+            const report = strategyReportMap[sid] || {};
+            const periodLabel = STRATEGY_PERIOD_MAP[sid] || '--';
+            const modal = document.getElementById('report-kline-modal');
+            const title = document.getElementById('report-kline-title');
+            const subtitle = document.getElementById('report-kline-subtitle');
+            if (title) title.innerText = `策略 ${sid} K线与成交量`;
+            if (subtitle) subtitle.innerText = `周期 ${periodLabel} · 区间 ${report.start_date || '--'} ~ ${report.end_date || '--'}`;
+            if (modal) {
+                modal.classList.remove('hidden');
+                modal.classList.add('flex');
+            }
+            if (!ensureReportKlineChart()) return;
+            const container = document.getElementById('report-kline-chart');
+            if (container && reportKlineChart) {
+                reportKlineChart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+            }
+            try {
+                const key = `${currentReportId}|${sid}`;
+                let data = reportKlinePayloadCache[key] || null;
+                if (!data) {
+                    const q = `report_id=${encodeURIComponent(currentReportId)}&strategy_id=${encodeURIComponent(sid)}`;
+                    const res = await fetch(`/api/report/strategy/kline_data?${q}`);
+                    data = await res.json();
+                    if (data.status === 'success' && Array.isArray(data.candles) && data.candles.length) {
+                        reportKlinePayloadCache[key] = data;
+                    }
+                }
+                if (data.status !== 'success') return;
+                const stockCode = data.stock || '--';
+                const periodText = data.period_label || periodLabel || '--';
+                const startText = report.start_date || '--';
+                const endText = report.end_date || '--';
+                if (title) title.innerText = `${stockCode} · ${periodText} · ${startText} ~ ${endText}`;
+                if (subtitle) subtitle.innerText = `策略 ${sid} · K线与成交量`;
+                const candles = Array.isArray(data.candles) ? data.candles : [];
+                const volumes = Array.isArray(data.volumes) ? data.volumes : [];
+                const markers = Array.isArray(data.markers) ? data.markers : [];
+                reportKlineCandleSeries.setData(candles);
+                reportKlineVolumeSeries.setData(volumes);
+                if (typeof reportKlineCandleSeries.setMarkers === 'function') {
+                    reportKlineCandleSeries.setMarkers(markers);
+                } else if (typeof LightweightCharts?.createSeriesMarkers === 'function') {
+                    LightweightCharts.createSeriesMarkers(reportKlineCandleSeries, markers);
+                }
+                reportKlineChart.timeScale().fitContent();
+            } catch (_) {}
+            finally {
+                await setReportKlineLoading(false);
+            }
+        }
+
+        function closeReportKline() {
+            const modal = document.getElementById('report-kline-modal');
+            if (modal) {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+            }
+        }
+
+        function openTradeDetails(strategyId) {
+            const sid = String(strategyId || '');
+            const report = strategyReportMap[sid] || {};
+            const rows = Array.isArray(report.trade_details) ? report.trade_details : [];
+            const title = document.getElementById('trade-detail-title');
+            if (title) title.innerText = `策略 ${sid || '--'} 交易明细`;
+            const body = document.getElementById('trade-detail-body');
+            if (body) {
+                if (!rows.length) {
+                    body.innerHTML = '<tr><td colspan="8" class="px-3 py-6 text-center text-slate-500">暂无交易明细</td></tr>';
+                } else {
+                    body.innerHTML = rows.map(t => {
+                        const dt = String(t.dt || '--');
+                        const dir = String(t.direction || '--');
+                        const price = Number(t.price || 0);
+                        const qty = Number(t.quantity || 0);
+                        const amount = Number(t.amount || 0);
+                        const cost = Number(t.cost || 0);
+                        const pnl = Number(t.pnl || 0);
+                        const reason = String(t.reason || '--');
+                        const dirCls = dir === 'BUY' ? 'text-rose-300' : (dir === 'SELL' ? 'text-emerald-300' : 'text-slate-300');
+                        const dirText = dir === 'BUY' ? '硅基' : (dir === 'SELL' ? '流码' : dir);
+                        const pnlCls = pnl >= 0 ? 'text-rose-300' : 'text-emerald-300';
+                        return `
+                            <tr class="hover:bg-slate-800/40">
+                                <td class="px-3 py-2 text-slate-300 font-mono">${dt}</td>
+                                <td class="px-3 py-2 ${dirCls}">${dirText}</td>
+                                <td class="px-3 py-2 text-right text-slate-200">${price.toFixed(2)}</td>
+                                <td class="px-3 py-2 text-right text-slate-200">${qty}</td>
+                                <td class="px-3 py-2 text-right text-slate-200">${amount.toFixed(2)}</td>
+                                <td class="px-3 py-2 text-right text-slate-200">${cost.toFixed(2)}</td>
+                                <td class="px-3 py-2 text-slate-300">${reason}</td>
+                                <td class="px-3 py-2 text-right ${pnlCls}">${pnl.toFixed(2)}</td>
+                            </tr>
+                        `;
+                    }).join('');
+                }
+            }
+            const modal = document.getElementById('trade-detail-modal');
+            if (modal) {
+                modal.classList.remove('hidden');
+                modal.classList.add('flex');
+            }
+        }
+
+        function closeTradeDetails() {
+            const modal = document.getElementById('trade-detail-modal');
+            if (modal) {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+            }
+        }
+
+        async function refreshAll() {
+            await loadHistory();
+            await loadReport(currentReportId || null);
+        }
+
+        document.getElementById('refresh-btn').addEventListener('click', refreshAll);
+        document.getElementById('return-console-btn')?.addEventListener('click', () => {
+            try {
+                sessionStorage.setItem('jince-disclaimer-skip-once-v1', '1');
+            } catch (_) {}
+        });
+        document.getElementById('history-list').addEventListener('click', async (e) => {
+            const target = e.target.closest('button[data-rid]');
+            if (!target) return;
+            currentReportId = String(target.dataset.rid);
+            await loadReport(currentReportId);
+            await loadHistory();
+        });
+        document.getElementById('history-list').addEventListener('click', async (e) => {
+            const target = e.target.closest('button[data-del-rid]');
+            if (!target) return;
+            await deleteHistoryReport(String(target.dataset.delRid || target.getAttribute('data-del-rid') || ''));
+        });
+        document.getElementById('trade-detail-close-btn').addEventListener('click', closeTradeDetails);
+        document.getElementById('trade-detail-modal').addEventListener('click', (e) => {
+            if (e.target && e.target.id === 'trade-detail-modal') closeTradeDetails();
+        });
+        document.getElementById('report-kline-close-btn').addEventListener('click', closeReportKline);
+        document.getElementById('report-kline-modal').addEventListener('click', (e) => {
+            if (e.target && e.target.id === 'report-kline-modal') closeReportKline();
+        });
+        window.addEventListener('resize', () => {
+            const container = document.getElementById('report-kline-chart');
+            if (reportKlineChart && container) {
+                reportKlineChart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+            }
+        });
+        setInterval(refreshAll, 15000);
+        refreshAll();
+    </script>
+</body>
+</html>

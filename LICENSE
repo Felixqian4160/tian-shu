@@ -1,0 +1,127 @@
+项目名称 / Project: <金策智算智能投研决策系统>
+版权所有 / Copyright (c): <2026> <硅基流码>
+
+==================================================================
+中文（Chinese）
+==================================================================
+
+本项目采用“个人非商业免费 + 商业需授权”许可模式。
+
+一、允许（免费）
+在遵守本许可全部条款前提下，任何个人或组织可免费将本项目用于：
+1) 个人学习；
+2) 学术研究；
+3) 本地自用（非商业目的）。
+
+二、禁止（未经书面授权）
+未经作者事先书面授权，禁止以下行为（包括但不限于）：
+1) 任何商业用途；
+2) 以售卖、租赁、托管、SaaS、云服务方式对外提供本项目或其衍生服务；
+3) 二次包装、二次分发并销售；
+4) 以本项目为核心或主要价值进行盈利部署；
+5) 移除、篡改本项目的版权、许可、免责声明信息。
+
+三、商业授权
+如需商业使用，必须提前联系作者获得商业授权：
+- 联系方式：zthx410@163.com
+- 授权范围、费用、期限、支持条款以双方书面商业协议为准。
+
+四、衍生与分发
+1) 允许在非商业场景下修改源码供个人学习研究；
+2) 任何对外分发（源码或二进制）必须保留本许可全文及版权声明；
+3) 衍生作品不得暗示获得作者背书或官方支持。
+
+五、免责声明（重要）
+1) 本项目及配套程序、数据、策略代码、回测引擎，仅用于量化学习、历史数据回测、技术研究与策略逻辑验证；
+2) 本项目不提供任何证券买卖点位推荐、不推荐具体股票/基金/期货等标的、不预测价格走势，不构成投资建议；
+3) 本项目不属于荐股软件，不属于投资咨询软件，不属于智能交易决策软件；
+4) 历史回测结果、指标结果、信号图表、策略参数均不代表未来收益，不得作为实盘交易依据；
+5) 证券、期货、基金等投资行为存在高风险，用户应自行判断并独立决策。
+
+六、开发者责任免除
+1) 开发者不具备证券投资咨询业务资质，不对外开展证券投资咨询活动，不提供任何形式的投资建议；
+2) 任何第三方利用本项目从事收费荐股、投资指导、收益承诺、会员费、分成、代客理财、直播分析、线下教学等经营活动，均属其独立行为；
+3) 上述第三方包括但不限于个人用户、机构用户、散户社群、茶馆/会所/线下交流场所、民宿/酒店/公寓/出租屋等住宿经营场所、经销商/代理商/合作方/推广渠道；
+4) 对上述第三方行为，开发者不知情、不授权、不参与、不控制、不获益，且不承担任何连带责任（包括民事赔偿、行政处罚、刑事责任）；
+5) 开发者不对软件稳定性、连续性、安全性作任何承诺，不对任何直接或间接损失承担责任，包括但不限于交易损失、数据丢失、设备故障、系统异常、业务中断及经济损失。
+
+七、用户义务与承诺
+1) 用户使用本项目即视为已阅读并同意本许可及免责声明全部条款；
+2) 用户承诺仅将本项目用于合法合规的学习研究用途，不用于任何非法证券活动、违规荐股、收费投资指导、代客理财；
+3) 用户应具备相应风险识别与承受能力，并自行承担使用本项目产生的全部风险与法律责任；
+4) 用户承诺遵守《证券法》《期货交易管理条例》《证券投资咨询业务管理暂行规定》等适用法律法规。
+
+八、违约与终止
+若使用者违反本许可任一条款，其使用授权自动终止。作者保留追究法律责任的权利。
+
+九、其他
+1) 本许可自首次发布之日起生效；
+2) 如本许可条款与商业协议冲突，以双方签署的商业协议为准；
+3) 因本项目产生的争议，适用中华人民共和国法律；
+4) 本许可最终解释权归作者所有（在适用法律允许范围内）。
+
+生效日期：<2026-03-23>
+作者签名：<硅基流码>
+
+
+==================================================================
+English
+==================================================================
+
+This project is licensed under a “Free for Personal Non-Commercial Use + Commercial License Required” model.
+
+1. Free Permitted Use (Non-Commercial)
+Subject to full compliance with this License, any individual or organization may use this project for free for:
+a) personal learning;
+b) academic research;
+c) local self-use for non-commercial purposes.
+
+2. Prohibited Without Prior Written Authorization
+Without prior written authorization from the author, the following are prohibited (including but not limited to):
+a) any commercial use;
+b) offering this project (or derivatives) via sale, rental, hosting, SaaS, or cloud service;
+c) repackaging/reselling or commercial redistribution;
+d) profit-oriented deployment where this project is the core or primary value;
+e) removing or altering copyright, license, or disclaimer notices.
+
+3. Commercial Licensing
+For any commercial use, you must obtain a separate commercial license in advance:
+- Contact: zthx410@163.com
+- Scope, fees, term, and support are subject to a separate written commercial agreement.
+
+4. Derivatives and Redistribution
+a) Modification is allowed for non-commercial learning/research;
+b) Any redistribution (source or binary) must retain this License and copyright notice;
+c) Derivative works must not imply endorsement or official support by the author.
+
+5. Disclaimer (Important)
+a) This project and its associated programs, data, strategy code, and backtesting engine are provided solely for quantitative learning, historical backtesting, technical research, and strategy validation;
+b) It does NOT provide buy/sell recommendations, does NOT recommend specific securities/funds/futures, does NOT predict prices, and does NOT constitute investment advice;
+c) It is NOT stock-picking software, NOT investment advisory software, and NOT an automated investment decision software;
+d) Historical backtest reports, indicators, signals, and strategy parameters do NOT represent future performance and must not be used as the sole basis for live trading decisions;
+e) Investment in securities, futures, and funds involves substantial risk, and users are solely responsible for independent judgment.
+
+6. Developer Liability Exclusion
+a) The developer does not hold securities investment advisory qualifications and does not provide securities advisory services;
+b) Any third party using this project for paid stock recommendations, investment guidance, guaranteed-return claims, profit-sharing, managed accounts, livestream analysis, or offline training acts independently;
+c) Such third parties include but are not limited to individuals, institutions, investor groups, teahouses/clubs/offline venues, lodging operators (homestays/hotels/apartments/rentals), distributors/agents/partners/promotion channels;
+d) The developer is not informed, does not authorize, does not participate, does not control, and does not profit from such acts, and bears no joint liability (civil, administrative, or criminal);
+e) The project is provided on an open-source basis without warranties of stability, continuity, or security, and the developer is not liable for any direct or indirect damages, including but not limited to trading loss, data loss, hardware failure, system failure, business interruption, or economic loss.
+
+7. User Obligations and Commitments
+a) By using this project, users are deemed to have read and agreed to all terms of this License and Disclaimer;
+b) Users shall use this project only for lawful learning/research purposes and shall not engage in illegal securities activities, unlawful stock recommendation, paid investment advisory, or managed-account services;
+c) Users are solely responsible for all risks, liabilities, and legal consequences arising from use of this project;
+d) Users must comply with all applicable laws and regulations.
+
+8. Breach and Termination
+Any violation of this License automatically terminates your rights under this License. The author reserves all legal remedies.
+
+9. Miscellaneous
+a) This License is effective from the first publication date;
+b) If there is any conflict between this License and a signed commercial agreement, the commercial agreement prevails;
+c) Any dispute arising from this project shall be governed by the laws of the People's Republic of China;
+d) The author reserves the final right of interpretation to the extent permitted by applicable law.
+
+Effective Date: <2026-03-23>
+Author (optional signature): <Scott-ZT>

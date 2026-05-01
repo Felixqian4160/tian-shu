@@ -1,0 +1,604 @@
+{
+  "system": {
+    "mode": "live",
+    "enable_live": false,
+    "initial_capital": 1000000,
+    "live_kline_log_on_change_only": true,
+    "log_level": "INFO",
+    "server_host": "0.0.0.0",
+    "server_port": 8000,
+    "private_override_paths": [
+      "data_provider.tushare_token",
+      "data_provider.default_api_key",
+      "data_provider.llm_api_key",
+      "data_provider.strategy_llm_api_key",
+      "data_provider.api_key",
+      "data_provider.mysql_password",
+      "data_provider.postgres_password",
+      "data_provider.default_api_url",
+      "webhook_notification.feishu_webhook_url",
+      "webhook_notification.feishu_secret",
+      "evolution.llm.api_key"
+    ],
+    "live_auto_start_enabled": false,
+    "live_auto_start_time": "09:20",
+    "live_auto_start_strategy_ids": []
+  },
+  "data_provider": {
+    "source": "jarvis_duckdb",
+    "enable_fallback": false,
+    "tushare_api_url": "http://tushare.xyz",
+    "tushare_token": "f10cbaea839fe80325b017ae338aa321e95fd905b9a96b9ec48d07c2",
+    "default_api_key": "",
+    "default_api_url": "",
+    "mysql_host": "192.168.18.62",
+    "mysql_port": 3306,
+    "mysql_user": "root",
+    "mysql_password": "",
+    "mysql_database": "quantifydata",
+    "mysql_charset": "utf8mb4",
+    "mysql_pool_size": 6,
+    "mysql_pool_wait_timeout_sec": 10,
+    "mysql_query_page_size": 20000,
+    "mysql_table_1min": "dat_1mins",
+    "mysql_table_5min": "dat_5mins",
+    "mysql_table_10min": "dat_10mins",
+    "mysql_table_15min": "dat_15mins",
+    "mysql_table_30min": "dat_30mins",
+    "mysql_table_60min": "dat_60mins",
+    "mysql_table_day": "dat_day",
+    "postgres_host": "127.0.0.1",
+    "postgres_port": 5432,
+    "postgres_user": "",
+    "postgres_password": "",
+    "postgres_database": "",
+    "postgres_schema": "public",
+    "postgres_pool_size": 6,
+    "postgres_pool_wait_timeout_sec": 10,
+    "postgres_query_page_size": 20000,
+    "postgres_table_1min": "dat_1mins",
+    "postgres_table_5min": "dat_5mins",
+    "postgres_table_10min": "dat_10mins",
+    "postgres_table_15min": "dat_15mins",
+    "postgres_table_30min": "dat_30mins",
+    "postgres_table_60min": "dat_60mins",
+    "postgres_table_day": "dat_day",
+    "duckdb_path": "G:\\duckdb\\quantifydata.duckdb",
+    "duckdb_query_page_size": 20000,
+    "duckdb_table_1min": "dat_1mins",
+    "duckdb_table_5min": "dat_5mins",
+    "duckdb_table_10min": "dat_10mins",
+    "duckdb_table_15min": "dat_15mins",
+    "duckdb_table_30min": "dat_30mins",
+    "duckdb_table_60min": "dat_60mins",
+    "duckdb_table_day": "dat_day",
+    "backtest_cache_db_source": "",
+    "llm_api_url": "https://api.siliconflow.cn/v1",
+    "llm_api_key": "",
+    "llm_model": "Qwen/Qwen3-VL-235B-A22B-Instruct",
+    "strategy_llm_api_url": "https://api.siliconflow.cn/v1",
+    "strategy_llm_api_key": "",
+    "strategy_llm_model": "Qwen/Qwen3-VL-235B-A22B-Instruct",
+    "strategy_llm_timeout_sec": 240,
+    "api_key": "",
+    "adjustment_mode": "hfq",
+    "tdxdir": "D:\\new_tdx64",
+    "tdx_host": "",
+    "tdx_port": 0,
+    "tdx_node_list": "",
+    "tdx_timeout_sec": 0,
+    "tdx_retry_count": 0,
+    "tdx_max_bars": 0
+  },
+  "history_sync": {
+    "scheduler_enabled": false,
+    "interval_minutes": 60,
+    "time_mode": "custom",
+    "lookback_days": 20,
+    "custom_start_time": "2026-04-01 09:30:00",
+    "custom_end_time": "2026-04-01 15:00:00",
+    "session_only": true,
+    "intraday_mode": false,
+    "max_codes": 10000,
+    "batch_size": 500,
+    "tables": [
+      "dat_1mins",
+      "dat_5mins",
+      "dat_10mins",
+      "dat_15mins",
+      "dat_30mins",
+      "dat_60mins",
+      "dat_days"
+    ],
+    "dry_run": false,
+    "on_duplicate": "ignore",
+    "write_mode": "direct_db",
+    "direct_db_source": ""
+  },
+  "targets": [
+    "600036.SH",
+    "000001.SZ",
+    "600519.SH"
+  ],
+  "strategies": {
+    "active_ids": [
+      "00",
+      "03",
+      "05",
+      "06",
+      "07",
+      "v14"
+    ]
+  },
+  "risk_control": {
+    "max_stop_loss_pct": 0.1,
+    "max_pos_per_stock": 1,
+    "max_total_pos": 1,
+    "max_daily_loss_pct": 0.05,
+    "max_drawdown_pct": 0.06
+  },
+  "trading_cost": {
+    "commission_rate": 0.00025,
+    "min_commission": 5,
+    "stamp_duty": 0.001,
+    "transfer_fee": 0
+  },
+  "execution": {
+    "slippage": 0.001,
+    "settlement_rule": "T+1"
+  },
+  "global_backtest_baseline": {
+    "enabled": true,
+    "default_profile": "cn_equity_mid_long",
+    "fallback_profile": "cn_equity_mid_long",
+    "enforce_defaults": true,
+    "min_history_years": 5,
+    "require_regime_coverage": true,
+    "lock_backtest_data_source": false,
+    "fixed_data_source": "default",
+    "strategy_profile_mapping": [
+      {
+        "rule_id": "r1_cn_equity_mid_long",
+        "if": {
+          "market": [
+            "A股"
+          ],
+          "strategy_tags_any": [
+            "中线",
+            "波段",
+            "长线",
+            "量化",
+            "价值"
+          ]
+        },
+        "then_profile": "cn_equity_mid_long"
+      },
+      {
+        "rule_id": "r2_cn_equity_tech_short",
+        "if": {
+          "market": [
+            "A股"
+          ],
+          "strategy_tags_any": [
+            "短线",
+            "形态",
+            "突破",
+            "均线",
+            "MACD"
+          ]
+        },
+        "then_profile": "cn_equity_tech_short"
+      },
+      {
+        "rule_id": "r3_cn_equity_intraday",
+        "if": {
+          "market": [
+            "A股"
+          ],
+          "strategy_tags_any": [
+            "超短",
+            "日内",
+            "打板",
+            "成本核对"
+          ]
+        },
+        "then_profile": "cn_equity_intraday"
+      },
+      {
+        "rule_id": "r4_t0_markets",
+        "if": {
+          "market_any": [
+            "可转债",
+            "港股",
+            "美股",
+            "ETF_T0"
+          ],
+          "supports_t0": true
+        },
+        "then_profile": "t0_cross_market"
+      }
+    ],
+    "profiles": {
+      "cn_equity_mid_long": {
+        "asset_scope": "A股中长线/量化",
+        "adjustment_mode": "hfq",
+        "settlement_rule": "T+1",
+        "cost_model": {
+          "commission_rate": 0.00025,
+          "min_commission": 5,
+          "stamp_duty_sell": 0.001,
+          "slippage": 0.001
+        }
+      },
+      "cn_equity_tech_short": {
+        "asset_scope": "A股短线技术形态",
+        "adjustment_mode": "qfq",
+        "settlement_rule": "T+1",
+        "cost_model": {
+          "commission_rate": 0.00025,
+          "min_commission": 5,
+          "stamp_duty_sell": 0.001,
+          "slippage": 0.001
+        }
+      },
+      "cn_equity_intraday": {
+        "asset_scope": "A股超短线/成本核对",
+        "adjustment_mode": "none",
+        "settlement_rule": "T+1",
+        "cost_model": {
+          "commission_rate": 0.00025,
+          "min_commission": 5,
+          "stamp_duty_sell": 0.001,
+          "slippage": 0.001
+        }
+      },
+      "t0_cross_market": {
+        "asset_scope": "可转债/港股/美股/T+0品种",
+        "adjustment_mode": "hfq",
+        "settlement_rule": "T+0",
+        "cost_model": {
+          "commission_rate": 0.00025,
+          "min_commission": 5,
+          "stamp_duty_sell": 0.001,
+          "slippage": 0.001
+        }
+      }
+    },
+    "last_applied_profile": "cn_equity_mid_long",
+    "last_applied_market": "A股"
+  },
+  "live_monitoring": {
+    "sync_with_backtest_cost_model": true,
+    "realtime_sync_to_default": {
+      "enabled": true,
+      "sources": [
+        "tushare",
+        "akshare",
+        "mysql",
+        "postgresql",
+        "duckdb"
+      ],
+      "on_duplicate": "update"
+    },
+    "consistency_checks": {
+      "enforce_adjustment_and_settlement_match": true,
+      "signal_execution_delay_seconds_warn": 5,
+      "signal_execution_delay_seconds_critical": 15,
+      "expected_vs_actual_price_deviation_warn": 0.003,
+      "expected_vs_actual_price_deviation_critical": 0.008
+    },
+    "risk_alerts": {
+      "daily_drawdown_warn": 0.02,
+      "daily_drawdown_critical": 0.03,
+      "max_drawdown_critical": 0.15,
+      "max_consecutive_losses_warn": 3,
+      "max_consecutive_losses_critical": 5,
+      "single_position_weight_warn": 0.15,
+      "single_position_weight_critical": 0.2,
+      "turnover_rate_warn": 0.5,
+      "turnover_rate_critical": 0.8
+    },
+    "execution_alerts": {
+      "liquidity_insufficient_warn": true,
+      "limit_hit_fail_warn": true,
+      "suspension_fail_warn": true
+    },
+    "drift_detection": {
+      "rolling_days": 20,
+      "win_rate_drop_warn": 0.08,
+      "profit_loss_ratio_drop_warn": 0.2,
+      "max_drawdown_expansion_warn": 0.3
+    },
+    "actions": {
+      "on_warn": [
+        "reduce_position"
+      ],
+      "on_critical": [
+        "pause_strategy",
+        "switch_to_observation",
+        "manual_review"
+      ]
+    },
+    "reporting": {
+      "daily_t1_deviation_report": true,
+      "weekly_attribution_report": true
+    },
+    "minute_close_confirm": {
+      "enabled": false
+    }
+  },
+  "webhook_notification": {
+    "enabled": true,
+    "event_types": [
+      "trade_exec",
+      "live_alert",
+      "zhongshu",
+      "menxia",
+      "daily_summary",
+      "system"
+    ],
+    "webhook_urls": [],
+    "feishu_webhook_url": "",
+    "feishu_secret": "",
+    "dedupe_window_seconds": 12,
+    "timeout_sec": 5,
+    "max_retries": 2,
+    "retry_backoff_seconds": 1.2,
+    "persist_failed_events": true,
+    "failed_events_file": "data/webhook_failed_events.jsonl",
+    "failed_retry_interval_seconds": 30,
+    "failed_retry_batch_size": 20,
+    "failed_max_retry": 20,
+    "category_filter_mode": "whitelist",
+    "category_codes": [
+      "A",
+      "B",
+      "D",
+      "E",
+      "F",
+      "I"
+    ]
+  },
+  "strategy_params": {
+    "common": {
+      "order_qty_mode": "cash_pct",
+      "order_qty": 100,
+      "order_cash_pct": 100
+    },
+    "01": {
+      "min_history_bars": 500,
+      "daily_ma10_tolerance": 0.02,
+      "volume_ma_window": 5,
+      "stop_loss_pct": 0.03
+    },
+    "02": {
+      "max_hold_bars": 240
+    },
+    "03": {
+      "stop_loss_pct": 0.05
+    },
+    "05": {
+      "min_30m_bars": 20,
+      "volume_ma_window": 5,
+      "volume_multiple": 1.5,
+      "max_hold_bars": 1200,
+      "stop_loss_pct": 0.05,
+      "take_profit_pct": 0.1
+    },
+    "06": {
+      "min_history_bars": 50,
+      "ma_period": 26,
+      "trailing_stop_pct": 0.01,
+      "stop_loss_pct": 0.01
+    },
+    "07": {
+      "min_15m_bars": 20,
+      "gap_down_multiplier": 0.998,
+      "trailing_stop_pct": 0.01,
+      "stop_loss_pct": 0.01
+    },
+    "08": {
+      "min_history_bars": 13,
+      "trailing_stop_pct": 0.01,
+      "stop_loss_pct": 0.01
+    },
+    "09": {
+      "box_period": 240,
+      "break_pct": 0.05,
+      "rsi_period": 14,
+      "rsi_oversold": 30,
+      "rsi_overbought": 70,
+      "base_build_rsi": 35,
+      "buy_zone_ratio": 0.15,
+      "sell_zone_ratio": 0.15,
+      "base_order_qty": 600,
+      "dynamic_order_qty": 350,
+      "max_dynamic_qty": 1050,
+      "stop_loss_pct": 0.05
+    }
+  },
+  "evolution": {
+    "llm": {
+      "enabled": true,
+      "provider": "openai_compatible",
+      "model": "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+      "base_url": "https://api.siliconflow.cn/v1",
+      "timeout_seconds": 120,
+      "retry_times": 1,
+      "api_key": "",
+      "fallback_to_mock": true,
+      "temperature": 0.2,
+      "max_tokens": 1200,
+      "system_prompt": "你是量化策略生成助手。只输出可执行Python策略代码（不要解释、不要markdown）。必须继承BaseImplementedStrategy，并实现on_bar。禁止使用未来函数/回看偏差。遵守A股规则：T+1、涨停不可买、跌停不可卖。"
+    },
+    "data_sources": {
+      "health_check_interval": 30,
+      "cache_ttl": 300,
+      "max_retry_attempts": 3,
+      "circuit_breaker_threshold": 5,
+      "circuit_breaker_timeout": 300,
+      "sources": [
+        {
+          "name": "primary_api",
+          "source_type": "primary",
+          "connection_params": {
+            "url": "",
+            "api_key": "",
+            "timeout": 30
+          },
+          "priority": 1,
+          "enabled": true,
+          "retry_count": 3,
+          "retry_delay": 1
+        },
+        {
+          "name": "tushare_backup",
+          "source_type": "secondary",
+          "connection_params": {
+            "token": "",
+            "timeout": 30
+          },
+          "priority": 2,
+          "enabled": true,
+          "retry_count": 2,
+          "retry_delay": 2
+        },
+        {
+          "name": "local_cache",
+          "source_type": "cache",
+          "connection_params": {
+            "cache_dir": "data/history/cache"
+          },
+          "priority": 3,
+          "enabled": true,
+          "read_only": true
+        }
+      ]
+    },
+    "error_recovery": {
+      "enabled": true,
+      "max_error_history": 1000,
+      "recovery_policies": {
+        "network_error": {
+          "actions": [
+            "retry",
+            "fallback"
+          ],
+          "max_attempts": 3,
+          "base_delay": 2,
+          "max_delay": 30,
+          "fallback_sources": [
+            "tushare_backup",
+            "local_cache"
+          ]
+        },
+        "timeout_error": {
+          "actions": [
+            "retry",
+            "degrade"
+          ],
+          "max_attempts": 2,
+          "base_delay": 1,
+          "max_delay": 10
+        },
+        "rate_limit_error": {
+          "actions": [
+            "retry",
+            "degrade"
+          ],
+          "max_attempts": 2,
+          "base_delay": 5,
+          "max_delay": 60
+        },
+        "data_error": {
+          "actions": [
+            "fallback",
+            "ignore"
+          ],
+          "fallback_sources": [
+            "local_cache"
+          ]
+        },
+        "system_error": {
+          "actions": [
+            "circuit_break",
+            "escalate"
+          ],
+          "escalation_threshold": 3
+        }
+      }
+    },
+    "profile_update_store": {
+      "enabled": false,
+      "table": "evolution_profile_updates",
+      "schema": "evolution",
+      "cleanup_days": 30
+    },
+    "gene_run_store": {
+      "enabled": false,
+      "table": "evolution_gene_runs",
+      "schema": "evolution",
+      "cleanup_days": 7
+    },
+    "alerts": {
+      "email": {
+        "enabled": false,
+        "level_threshold": "warning",
+        "rate_limit": 5,
+        "smtp_server": "smtp.gmail.com",
+        "smtp_port": 587,
+        "username": "",
+        "password": "",
+        "recipients": []
+      },
+      "feishu": {
+        "enabled": false,
+        "level_threshold": "warning",
+        "rate_limit": 10,
+        "webhook_url": ""
+      },
+      "dingtalk": {
+        "enabled": false,
+        "level_threshold": "warning",
+        "rate_limit": 10,
+        "webhook_url": "",
+        "secret": ""
+      },
+      "webhook": {
+        "enabled": false,
+        "level_threshold": "error",
+        "rate_limit": 20,
+        "url": "",
+        "method": "POST",
+        "headers": {},
+        "custom_fields": {}
+      }
+    }
+  },
+  "fundamental_adapter": {
+    "enabled": true,
+    "apply_in_backtest": true,
+    "apply_in_live": true,
+    "prefetch_on_backtest_start": true,
+    "provider": "tushare",
+    "cache_ttl_sec": 0,
+    "min_refresh_interval_sec": 0,
+    "tushare_interfaces": {
+      "stock_basic": true,
+      "company": true,
+      "concept_detail": true,
+      "daily_basic": true,
+      "moneyflow": true,
+      "fina_indicator": true,
+      "income": true,
+      "balancesheet": true,
+      "cashflow": true,
+      "dividend": true,
+      "forecast": true,
+      "express": true
+    },
+    "disk_persist_enabled": false,
+    "disk_cache_dir": "",
+    "disk_cache_max_files": 0
+  }
+}
